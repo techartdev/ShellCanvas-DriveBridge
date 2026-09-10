@@ -374,6 +374,9 @@ impl FileSystemContext for Fs {
         changed: u64,
         info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if std::env::var("SHELLCANVAS_NATIVE_WINDOWS_TEST").as_deref() == Ok("1") {
+            eprintln!("NATIVE_METADATA_REQUEST: attributes={requested_attributes:#x} created={created} access={access} write={write} changed={changed}");
+        }
         validate_unsupported_times(created, changed).map_err(failure)?;
         let metadata = FsSetMetadata {
             accessed: unix_seconds(access).map_err(failure)?,
