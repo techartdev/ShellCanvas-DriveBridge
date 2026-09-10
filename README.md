@@ -134,6 +134,15 @@ cargo test --locked --test native_windows -- --ignored --nocapture
 
 This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
 
+[CI run 34521265017](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34521265017)
+at `9c4fbe1` verifies volume-wide flush through a native Windows volume handle.
+Three writable files are attempted even when one provider flush fails, with
+ERROR_IO_DEVICE returned to Windows. After clearing the injected fault, the next
+flush succeeds and backing bytes are independently verified for every file.
+The full native suite passes in 28.88 seconds. This tests propagation of provider
+durability results; physical power-loss behavior remains the storage provider's
+responsibility.
+
 [CI run 34518237898](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34518237898)
 at `e58d386` passes directory rename checks with open handles. Windows rejects
 renaming a directory containing an open child file with error 5; closing the
