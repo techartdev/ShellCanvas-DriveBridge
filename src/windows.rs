@@ -549,10 +549,12 @@ impl FileSystemContext for Fs {
 pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Result<()> {
     // Build against the bundled SDK; load only the separately installed runtime
     // from the machine registry. Never search a writable current directory.
+    let setup = |error| anyhow::anyhow!("WinFsp is unavailable. Install or repair the WinFsp runtime from https://winfsp.dev/rel/, then try attaching again. Driver setup requires administrator approval. Details: {error}");
     let installation = windows_registry::LOCAL_MACHINE
         .open("SOFTWARE\\WOW6432Node\\WinFsp")
-        .or_else(|_| windows_registry::LOCAL_MACHINE.open("SOFTWARE\\WinFsp"))?
-        .get_string("InstallDir")?;
+        .or_else(|_| windows_registry::LOCAL_MACHINE.open("SOFTWARE\\WinFsp"))
+        .map_err(&setup)?
+        .get_string("InstallDir").map_err(&setup)?;
     let dll = if cfg!(target_arch = "aarch64") {
         "winfsp-a64.dll"
     } else {
@@ -567,7 +569,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
             None,
             ::windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
                 | ::windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )?;
+        ).map_err(|error| anyhow::anyhow!("Cannot load the installed WinFsp runtime at {}. Install or repair WinFsp for this computer from https://winfsp.dev/rel/. Details: {error}", dll.display()))?;
     }
     let _runtime = winfsp::winfsp_init().map_err(|e| {
         anyhow::anyhow!(
