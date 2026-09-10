@@ -95,8 +95,16 @@ it creates and removes test files and must not receive a user's working folder.
   even when opening failed after the remote handle was acquired. These paths have
   bookkeeping tests; they still need live WinFsp acceptance. WinFsp's normal Windows
   rename/share rules may refuse renames while child files are open.
-- The FUSE backend uses direct I/O to avoid silently serving a stale file-content
-  cache. Memory-mapped application workflows need explicit acceptance testing.
+- The FUSE backend uses direct I/O for ordinary reads/writes. On Linux kernels
+  advertising `FUSE_DIRECT_IO_ALLOW_MMAP`, it also enables shared memory mapping.
+  Native Linux 6.8 acceptance passed shared cross-page writes with `msync`, mapping
+  lifetime after descriptor close, read-only mapping and private copy-on-write
+  mapping; the underlying SFTP source was checked independently. Mapped stores
+  reach the provider when pages are flushed, not on each CPU write. Coherence
+  with concurrent remote edits and database/VM workloads is not promised.
+  Kernels without that capability keep their existing direct-I/O limitations.
+  macOS and Windows mapped-file acceptance remain pending. See the
+  [Linux FUSE I/O contract](https://www.kernel.org/doc/html/latest/filesystems/fuse/fuse-io.html).
 - Driver setup, live filesystem acceptance and graceful busy detach remain release
   gates. This preview should not be used for valuable working files yet.
 
