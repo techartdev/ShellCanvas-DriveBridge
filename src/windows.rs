@@ -76,6 +76,7 @@ pub struct Context {
     pipe: Arc<Pipe>,
 }
 struct Fs {
+    warned_change_time: std::sync::atomic::AtomicBool,
     handles: crate::windows_handles::OpenHandles,
     gate: Arc<crate::mount_gate::MountGate>,
     pipe: Arc<Pipe>,
@@ -374,10 +375,11 @@ impl FileSystemContext for Fs {
         changed: u64,
         info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        if std::env::var("SHELLCANVAS_NATIVE_WINDOWS_TEST").as_deref() == Ok("1") {
-            eprintln!("NATIVE_METADATA_REQUEST: attributes={requested_attributes:#x} created={created} access={access} write={write} changed={changed}");
-        }
-        validate_unsupported_times(created, changed).map_err(failure)?;
+        // CopyFileW includes metadata-change time alongside modification time,
+        // then ignores an unsupported result. Preserve representable times and
+        // warn about the omitted change time instead of silently losing mtime.
+        let omitted_change_time = changed != 0 && (access != 0 || write != 0);
+        validate_unsupported_times(created, if omitted_change_time { 0 } else { changed }).map_err(failure)?;
         let metadata = FsSetMetadata {
             accessed: unix_seconds(access).map_err(failure)?,
             modified: unix_seconds(write).map_err(failure)?,
@@ -399,6 +401,9 @@ impl FileSystemContext for Fs {
             }
         }
         fill(info, &self.metadata(context)?);
+        if omitted_change_time && !self.warned_change_time.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.warn("Metadata-change time is unavailable on this remote filesystem. Requested access/modification times were preserved; change time was omitted.".into());
+        }
         Ok(())
     }
     fn rename(
@@ -589,6 +594,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
     let mut host = FileSystemHost::<_, winfsp::host::CoarseGuard>::new(
         params,
         Fs {
+            warned_change_time: std::sync::atomic::AtomicBool::new(false),
             handles: crate::windows_handles::OpenHandles::default(),
             gate: gate.clone(),
             pipe: pipe.clone(),

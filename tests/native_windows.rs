@@ -556,7 +556,7 @@ fn file_times(target: &Path, source: &Path) -> Result<()> {
         "Modification time did not reach backing file");
     for rejected in [
         FILE_BASIC_INFO { CreationTime: initial.LastWriteTime, LastWriteTime: initial.LastWriteTime + 10_000_000, FileAttributes: FILE_ATTRIBUTE_READONLY.0, ..Default::default() },
-        FILE_BASIC_INFO { ChangeTime: initial.LastWriteTime, LastWriteTime: initial.LastWriteTime + 10_000_000, ..Default::default() },
+        FILE_BASIC_INFO { ChangeTime: initial.LastWriteTime, ..Default::default() },
         FILE_BASIC_INFO { LastWriteTime: EPOCH - 10_000_000, ..Default::default() },
     ] {
         ensure!(apply(&rejected).is_err(), "Unsupported time change falsely succeeded");
@@ -565,6 +565,12 @@ fn file_times(target: &Path, source: &Path) -> Result<()> {
             "Rejected timestamp request changed backing times");
         ensure!(!after.permissions().readonly(), "Rejected time request partially changed permissions");
     }
+    // CopyFileW bundles metadata-change time with supported modification time.
+    // Preserve the latter and report the unsupported field to the parent.
+    apply(&FILE_BASIC_INFO { ChangeTime: initial.LastWriteTime,
+        LastWriteTime: initial.LastWriteTime + 10_000_000, ..Default::default() })?;
+    ensure!(fs::metadata(&backing)?.modified()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_124,
+        "Bundled metadata-change time prevented supported modification time");
     drop(file);
     fs::remove_file(&path)?;
     println!("NATIVE_WINDOWS_TIMES_PASS: access/modification times reach source through attribute-only handle; unavailable times stay absent; unsupported mixed requests have no partial effects");
@@ -762,6 +768,7 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         }
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || exercise(&p, &source)).await??;
+        warning(&control, "Metadata-change time is unavailable").await?;
         let p = target.clone(); let source = backing.path().to_owned();
         let volume_name = mount.clone(); let audit = flush_audit.clone();
         tokio::task::spawn_blocking(move || volume_flush(&volume_name, &p, &source, &audit)).await??;
