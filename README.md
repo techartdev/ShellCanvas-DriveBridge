@@ -89,7 +89,8 @@ it creates and removes test files and must not receive a user's working folder.
 - Windows ACLs, alternate data streams, distributed locks, remote hard-link
   identity and database/VM-image compatibility are not claimed. Windows cleanup
   failures report structured warnings to ShellCanvas as well as stderr. Native
-  lifecycle acceptance is still required before release.
+  failure injection verifies delivery of close/deletion warnings and preservation
+  of the source after failed deletion. Full desktop lifecycle acceptance remains.
 - Windows volume flush visits all writable descriptors, preserving the first
   failure while attempting the others. Confirmed renames update other open path
   references; failed renames preserve them. Descriptor drop closes remote handles
@@ -132,6 +133,14 @@ cargo test --locked --test native_windows -- --ignored --nocapture
 ```
 
 This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
+
+[CI run 34512537189](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34512537189)
+at `36464c5` also passes write-through failure checks: I/O, offline, timed-out and
+read-only writes return their corresponding Windows errors without changing the
+backing bytes. Failed flush returns an error; unrelated I/O remains usable.
+Failed close and cleanup-time deletion reach the parent as warnings, and failed
+deletion preserves the source file. These are injected provider errors, not a
+real network outage or exhausted remote disk.
 
 ## Licensing and commercial distribution
 
