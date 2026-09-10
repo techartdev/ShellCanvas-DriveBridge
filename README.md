@@ -167,7 +167,7 @@ acceptance as root at `1459801` cuts the actual pipes with a local file open ove
 the core SFTP provider: write and close return ENOTCONN, confirmed source bytes
 remain unchanged, the helper exits unsuccessfully and the native mount table
 shows removal. The fixture and staged binary were then verified removed.
-Non-root helper fallback and modern macOS failure cleanup remain unverified.
+Modern macOS failure cleanup remains unverified. Non-root Linux results follow.
 ShellCanvas retains failed mappings for
 inspection and verifies the OS mount table before releasing cleanup ownership.
 
@@ -179,7 +179,22 @@ The Linux artifact also passes native Linux 6.8 testing through the core SFTP
 provider: repeated rewinds of the same directory descriptor return exact paged
 contents, including after renaming the open directory. The earlier I/O, mmap and
 busy-detach checks pass, with independently confirmed fixture/mount cleanup.
-This does not establish native injected-failure or non-root acceptance.
+This does not establish native injected-reopen-failure acceptance.
+
+The same `87a28c9` Linux artifact also passes as an unprivileged mounting user
+(UID 65534) on Linux 6.8 using the installed setuid `fusermount3` helper. Local
+file operations, rewinds/renames, memory mapping, busy-detach protection and
+ordinary unmount pass. Source bytes are independently checked by the source
+owner. Cutting both bridge pipes with a file open returns ENOTCONN for write and
+close, preserves confirmed source bytes, produces a failure exit and removes the
+mount without privileged recovery. Both disposable fixture trees, mounts and
+the staged binary were independently confirmed removed. No system FUSE settings
+or accounts were changed for the test.
+
+The core's `native_bridge_probe` has an opt-in
+`SHELLCANVAS_PROBE_UNPRIVILEGED=1` mode for this existing-account test; combine it
+with `SHELLCANVAS_PROBE_TRANSPORT_LOSS=1` for pipe-loss acceptance. This result is
+specific to that Linux/runtime combination, not a guarantee for every distribution.
 
 ## Licensing and commercial distribution
 
