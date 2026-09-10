@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 use super::*;
+use crate::windows_attributes::attributes;
 use ::windows::Win32::Foundation::*;
 use std::{
     collections::VecDeque,
@@ -56,13 +57,6 @@ fn timestamp(seconds: Option<u64>) -> u64 {
 }
 fn unix_timestamp(time: u64) -> Option<u64> {
     (time != 0 && time != u64::MAX).then(|| (time / 10_000_000).saturating_sub(11_644_473_600))
-}
-fn attributes(meta: &FsMetadata) -> u32 {
-    if meta.kind == FsKind::Directory {
-        0x10
-    } else {
-        0x80
-    }
 }
 fn fill(info: &mut FileInfo, meta: &FsMetadata) {
     *info = FileInfo::default();
@@ -164,7 +158,7 @@ impl Fs {
         } else {
             // Attribute-only handles need a remote read handle for fstat and
             // stable object identity; the account still controls access.
-            let requested_write = access & (0x2 | 0x4 | 0x100) != 0;
+            let requested_write = access & (0x2 | 0x4) != 0;
             // Creating an empty file requires write on the SFTP handle even if
             // the caller requested only read/attribute access. WinFsp enforces
             // the caller's GrantedAccess; the root must still permit writes.
@@ -187,7 +181,7 @@ impl Fs {
         let tracked = Arc::new(crate::windows_handles::OpenHandle {
             path: path.clone(),
             file: Mutex::new(file),
-            writable: access & (0x2 | 0x4 | 0x100) != 0 || create != FsCreate::OpenExisting,
+            writable: access & (0x2 | 0x4) != 0 || create != FsCreate::OpenExisting,
         });
         let context = Context {
             _open: open,
@@ -381,7 +375,7 @@ impl FileSystemContext for Fs {
     fn set_basic_info(
         &self,
         context: &Context,
-        _: u32,
+        requested_attributes: u32,
         _: u64,
         access: u64,
         write: u64,
@@ -391,9 +385,14 @@ impl FileSystemContext for Fs {
         let metadata = FsSetMetadata {
             accessed: unix_timestamp(access),
             modified: unix_timestamp(write),
+            permissions: crate::windows_attributes::permissions(&self.metadata(context)?, requested_attributes)
+                .map_err(failure)?,
             ..Default::default()
         };
-        if metadata.accessed.is_some() || metadata.modified.is_some() {
+        if metadata.accessed.is_some() || metadata.modified.is_some() || metadata.permissions.is_some() {
+            if !self.caps.writable {
+                return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
+            }
             if let Some(handle) = context.file {
                 self.call(Operation::SetFileMetadata { handle, metadata })?;
             } else {

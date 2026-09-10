@@ -17,6 +17,8 @@ mod probe;
 mod windows;
 #[cfg(any(windows, test))]
 mod windows_handles;
+#[cfg(any(windows, test))]
+mod windows_attributes;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();

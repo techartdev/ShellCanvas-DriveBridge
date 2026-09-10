@@ -50,10 +50,15 @@ fn metadata(m: fs::Metadata) -> FsMetadata {
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs()),
-        permissions: None,
+        permissions: Some(if m.permissions().readonly() { 0o444 } else { 0o644 }),
     }
 }
 fn set(file: &fs::File, m: FsSetMetadata) -> std::io::Result<()> {
+    if let Some(mode) = m.permissions {
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(mode & 0o222 == 0);
+        file.set_permissions(permissions)?;
+    }
     if let Some(size) = m.size {
         file.set_len(size)?;
     }
@@ -202,6 +207,11 @@ impl MountedFileSystem for LocalRoot {
         file.read(options.read)
             .write(options.write)
             .truncate(options.truncate);
+        // Model a provider that permits owner metadata changes on a data-read
+        // handle, as SFTP FSETSTAT does. This must not request data-write access.
+        use std::os::windows::fs::OpenOptionsExt;
+        file.access_mode((if options.read { 0x80000000 } else { 0 })
+            | (if options.write { 0x40000000 } else { 0 }) | 0x100);
         match options.create {
             FsCreate::OpenExisting => {}
             FsCreate::CreateNew => {
@@ -486,6 +496,33 @@ fn volume_flush(mount: &str, target: &Path, source: &Path, audit: &FlushAudit) -
     Ok(())
 }
 
+fn file_attributes(target: &Path, source: &Path) -> Result<()> {
+    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    let path = target.join("attributes.txt");
+    let backing = source.join("attributes.txt");
+    fs::write(&path, b"preserve")?;
+    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_READONLY)?; }
+    ensure!(fs::metadata(&path)?.permissions().readonly(), "Mapped read-only attribute not reported");
+    ensure!(fs::metadata(&backing)?.permissions().readonly(), "Read-only change did not reach provider");
+    ensure!(fs::OpenOptions::new().write(true).open(&path).is_err(), "Read-only file allowed a new writer");
+    ensure!(fs::remove_file(&path).is_err(), "Read-only file allowed deletion");
+    ensure!(fs::read(&path)? == b"preserve", "Read-only file contents changed");
+    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    ensure!(!fs::metadata(&path)?.permissions().readonly(), "Mapped read-only attribute not cleared");
+    ensure!(!fs::metadata(&backing)?.permissions().readonly(), "Clearing read-only did not reach provider");
+    let unsupported = unsafe {
+        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY)
+    };
+    ensure!(unsupported.is_err(), "Unsupported hidden attribute falsely succeeded");
+    ensure!(!fs::metadata(&backing)?.permissions().readonly(), "Rejected attribute request partially changed permissions");
+    ensure!(fs::read(&backing)? == b"preserve", "Attribute request changed source bytes");
+    fs::write(&path, b"writable again")?;
+    ensure!(fs::read(&backing)? == b"writable again", "Cleared read-only file stayed unwritable");
+    fs::remove_file(&path)?;
+    println!("NATIVE_WINDOWS_ATTRIBUTES_PASS: read-only set/clear reaches provider, blocks new writes/deletion, and unsupported attributes fail without partial changes");
+    Ok(())
+}
+
 fn exercise(target: &Path, source: &Path) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -570,6 +607,7 @@ fn exercise(target: &Path, source: &Path) -> Result<()> {
     println!("NATIVE_WINDOWS_CAPACITY_PASS: Windows API reports provider capacity");
     mapped_files(target, source)?;
     rename_open_directory(target, source)?;
+    file_attributes(target, source)?;
     Ok(())
 }
 
