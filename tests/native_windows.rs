@@ -69,7 +69,7 @@ fn set(file: &fs::File, m: FsSetMetadata) -> std::io::Result<()> {
     }
     Ok(())
 }
-struct LocalFile(Mutex<Option<fs::File>>);
+struct LocalFile(Mutex<Option<fs::File>>, String);
 impl LocalFile {
     fn with<T>(&self, op: impl FnOnce(&mut fs::File) -> std::io::Result<T>) -> FsResult<T> {
         let mut guard = self.0.lock().unwrap();
@@ -94,6 +94,16 @@ impl MountedFile for LocalFile {
         })
     }
     async fn write_at(&self, offset: u64, bytes: &[u8]) -> FsResult<()> {
+        let fault = match self.1.as_str() {
+            "write-failed.bin" => Some(FsErrorKind::Io),
+            "write-offline.bin" => Some(FsErrorKind::Offline),
+            "write-timeout.bin" => Some(FsErrorKind::TimedOut),
+            "write-readonly.bin" => Some(FsErrorKind::ReadOnly),
+            _ => None,
+        };
+        if let Some(kind) = fault {
+            return Err(FsError::new(kind, "Injected write failure"));
+        }
         self.with(|f| {
             f.seek(SeekFrom::Start(offset))?;
             f.write_all(bytes)
@@ -103,10 +113,16 @@ impl MountedFile for LocalFile {
         self.with(|f| set(f, m))
     }
     async fn flush(&self) -> FsResult<()> {
+        if self.1 == "flush-failed.bin" {
+            return Err(FsError::new(FsErrorKind::Io, "Injected flush failure"));
+        }
         self.with(|f| f.sync_all())
     }
     async fn close(&self) -> FsResult<()> {
         self.0.lock().unwrap().take();
+        if self.1 == "close-failed.bin" {
+            return Err(FsError::new(FsErrorKind::Io, "Injected close failure"));
+        }
         Ok(())
     }
 }
@@ -188,9 +204,10 @@ impl MountedFileSystem for LocalRoot {
                 file.create(true);
             }
         }
-        Ok(Arc::new(LocalFile(Mutex::new(Some(
-            file.open(self.path(path)).map_err(error)?,
-        )))))
+        Ok(Arc::new(LocalFile(
+            Mutex::new(Some(file.open(self.path(path)).map_err(error)?)),
+            path.components().last().cloned().unwrap_or_default(),
+        )))
     }
     async fn open_directory(&self, path: &MountPath) -> FsResult<Box<dyn MountedDirectory>> {
         Ok(Box::new(LocalDirectory(Some(
@@ -208,6 +225,9 @@ impl MountedFileSystem for LocalRoot {
         fs::create_dir(self.path(path)).map_err(error)
     }
     async fn remove(&self, path: &MountPath, directory: bool) -> FsResult<()> {
+        if path.components().last().is_some_and(|p| p == "delete-failed.bin") {
+            return Err(FsError::new(FsErrorKind::PermissionDenied, "Injected cleanup deletion failure"));
+        }
         if directory {
             fs::remove_dir(self.path(path))
         } else {
@@ -244,6 +264,45 @@ async fn phase(control: &BridgeControl, expected: BridgePhase) -> Result<()> {
     })
     .await
     .context("Bridge lifecycle deadline")?
+}
+async fn warning(control: &BridgeControl, fragment: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if control.snapshot()?.message.as_deref().is_some_and(|m| m.contains(fragment)) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.context("Expected cleanup warning was not delivered")?
+}
+
+fn failed_writes(target: &Path, source: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::{Foundation::*, Storage::FileSystem::FILE_FLAG_WRITE_THROUGH};
+    for (name, code) in [
+        ("write-failed.bin", ERROR_IO_DEVICE),
+        ("write-offline.bin", ERROR_DEVICE_NOT_CONNECTED),
+        ("write-timeout.bin", ERROR_SEM_TIMEOUT),
+        ("write-readonly.bin", ERROR_WRITE_PROTECT),
+    ] {
+        let mut file = fs::OpenOptions::new().write(true)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH.0).open(target.join(name))?;
+        // Write-through makes success depend on the provider, not just dirtying
+        // a Windows cache page. Never replay the failed mutation automatically.
+        let error = file.write_all(b"must not be acknowledged").expect_err("Failed write reported success");
+        ensure!(error.raw_os_error() == Some(code.0 as i32), "{name}: wrong native status: {error}");
+        drop(file);
+        ensure!(fs::read(source.join(name))? == b"original", "{name}: failed write changed source");
+    }
+    let file = fs::OpenOptions::new().write(true).open(target.join("flush-failed.bin"))?;
+    let error = file.sync_all().expect_err("Failed durable flush reported success");
+    ensure!(error.raw_os_error() == Some(ERROR_IO_DEVICE.0 as i32), "Wrong flush status: {error}");
+    drop(file);
+    // Per-operation failure must not poison unrelated handles or the attachment.
+    fs::write(target.join("healthy-after-error.bin"), b"healthy")?;
+    ensure!(fs::read(source.join("healthy-after-error.bin"))? == b"healthy", "Attachment did not recover from operation failure");
+    println!("NATIVE_WINDOWS_FAILURE_PASS: failed/offline/timed-out/read-only writes and flush errors reach Windows; source preserved; unrelated I/O remains usable");
+    Ok(())
 }
 struct MappedView {
     mapping: windows::Win32::Foundation::HANDLE,
@@ -430,6 +489,9 @@ async fn native_windows_mount() -> Result<()> {
     let target = PathBuf::from(format!("{mount}\\"));
     let backing = tempfile::tempdir()?;
     fs::write(backing.path().join("denied.txt"), b"fixture")?;
+    for name in ["write-failed.bin", "write-offline.bin", "write-timeout.bin", "write-readonly.bin", "flush-failed.bin", "close-failed.bin", "delete-failed.bin"] {
+        fs::write(backing.path().join(name), b"original")?;
+    }
     let control = Arc::new(BridgeControl::default());
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shellcanvas-drive-bridge"))
         .args(["--mount", &mount])
@@ -449,6 +511,16 @@ async fn native_windows_mount() -> Result<()> {
         phase(&control, BridgePhase::Attached).await?;
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || exercise(&p, &source)).await??;
+        let p = target.clone(); let source = backing.path().to_owned();
+        tokio::task::spawn_blocking(move || failed_writes(&p, &source)).await??;
+        drop(fs::File::open(target.join("close-failed.bin"))?);
+        warning(&control, "Remote file close was not confirmed").await?;
+        // Windows cleanup has no error-return channel. The failure must reach
+        // the parent as a warning and leave the source file intact.
+        let _ = fs::remove_file(target.join("delete-failed.bin"));
+        warning(&control, "Remote deletion failed during Windows cleanup").await?;
+        ensure!(backing.path().join("delete-failed.bin").exists(), "Failed cleanup deletion lost source");
+        println!("NATIVE_WINDOWS_WARNING_PASS: close and cleanup deletion failures delivered to the parent");
         let held = fs::File::open(target.join("seek.bin"))?;
         control.request_detach()?;
         phase(&control, BridgePhase::Attached).await?;
