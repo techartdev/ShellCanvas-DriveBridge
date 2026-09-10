@@ -134,6 +134,16 @@ cargo test --locked --test native_windows -- --ignored --nocapture
 
 This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
 
+[CI run 34518237898](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34518237898)
+at `e58d386` passes directory rename checks with open handles. Windows rejects
+renaming a directory containing an open child file with error 5; closing the
+child permits rename while two directory handles remain open. Both handles
+continue returning metadata after rename. A failed replacement of a nonempty
+directory preserves both trees. These results match a separate NTFS baseline and
+[Microsoft's FileRenameInformation rules](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/87f86c9b-6c2a-4803-84b7-131a74a434fa).
+Linux/POSIX open-child rename behavior is different. All earlier native Windows
+checks also pass in that run (32.21 seconds).
+
 [CI run 34512537189](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34512537189)
 at `36464c5` also passes write-through failure checks: I/O, offline, timed-out and
 read-only writes return their corresponding Windows errors without changing the
