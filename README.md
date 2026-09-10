@@ -233,8 +233,8 @@ Read handles cannot truncate and read-only roots cannot change metadata.
 before changing timestamps or permissions. Directory read-only changes, absent
 permissions and transitions involving special Unix mode bits also report
 unsupported instead of silently changing unrelated permissions. Creation and
-overwrite attribute requests and creation/change-time semantics remain review
-items; this implementation does not claim full DOS-attribute persistence.
+overwrite attribute requests remain review items; this implementation does not
+claim full DOS-attribute persistence.
 
 The mapping and rejection regressions pass at `447b1c3`. Native WinFsp acceptance
 in [CI run 34523633220](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34523633220)
@@ -243,6 +243,28 @@ and rejection of a combined hidden/read-only request without partial changes.
 The core's live SFTP probe separately verifies metadata changes through a read
 handle, rejected truncation and read-only-root enforcement. These are separate
 provider and bridge checks; desktop-created Windows SFTP acceptance remains open.
+
+### Windows timestamps
+
+The portable contract exposes access/modification times at whole-second
+precision. Creation and metadata-change times remain unavailable (zero in the
+Windows response), rather than being synthesized from modification time. Missing
+or unrepresentable provider timestamps likewise remain unavailable. Explicit
+creation/change-time updates and dates before the Unix epoch return unsupported
+before changing any other requested metadata. Providers may reject narrower
+ranges; SFTP v3 has unsigned 32-bit seconds. Applications requiring preservation
+of creation time must handle that unsupported result.
+
+At `3f66501`, [CI run 34524595837](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34524595837)
+passes native Windows access/modification readback through an attribute-only
+handle and rejection of unsupported mixed requests without partial changes.
+Earlier native checks, all platform builds/tests and Windows clippy also pass.
+A separate live core SFTP check confirms single-field updates preserve the other
+timestamp and an out-of-range time combined with permissions has no partial
+effect. This is not proof that a provider supports birth/change-time storage.
+
+The callback follows [WinFsp's SetBasicInfo contract](https://winfsp.dev/doc/WinFsp-API-winfsp.h/):
+zero time values leave the respective timestamp unchanged.
 
 ## Licensing and commercial distribution
 
