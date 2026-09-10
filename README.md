@@ -86,9 +86,15 @@ it creates and removes test files and must not receive a user's working folder.
   not provide race-free `openat`/`nofollow` guarantees against concurrent remote
   path replacement.
 - Windows ACLs, alternate data streams, distributed locks, remote hard-link
-  identity and database/VM-image compatibility are not claimed. Windows deletion
-  failure during cleanup currently reports to stderr; visible failure handling
-  and lifecycle acceptance are still required before release.
+  identity and database/VM-image compatibility are not claimed. Windows cleanup
+  failures report structured warnings to ShellCanvas as well as stderr. Native
+  lifecycle acceptance is still required before release.
+- Windows volume flush visits all writable descriptors, preserving the first
+  failure while attempting the others. Confirmed renames update other open path
+  references; failed renames preserve them. Descriptor drop closes remote handles
+  even when opening failed after the remote handle was acquired. These paths have
+  bookkeeping tests; they still need live WinFsp acceptance. WinFsp's normal Windows
+  rename/share rules may refuse renames while child files are open.
 - The FUSE backend uses direct I/O to avoid silently serving a stale file-content
   cache. Memory-mapped application workflows need explicit acceptance testing.
 - Driver setup, live filesystem acceptance and graceful busy detach remain release

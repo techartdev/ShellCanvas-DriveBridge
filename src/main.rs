@@ -15,6 +15,8 @@ mod mount_gate;
 mod probe;
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_handles;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();

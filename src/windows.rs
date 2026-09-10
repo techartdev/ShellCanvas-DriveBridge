@@ -82,15 +82,45 @@ struct Directory {
 }
 pub struct Context {
     _open: crate::mount_gate::OpenGuard,
-    path: Mutex<MountPath>,
+    path: Arc<Mutex<MountPath>>,
     file: Option<u64>,
     directory: Mutex<Directory>,
     is_dir: bool,
+    tracked: Arc<crate::windows_handles::OpenHandle>,
+    pipe: Arc<Pipe>,
 }
 struct Fs {
+    handles: crate::windows_handles::OpenHandles,
     gate: Arc<crate::mount_gate::MountGate>,
     pipe: Arc<Pipe>,
     caps: FsCapabilities,
+}
+impl Drop for Context {
+    fn drop(&mut self) {
+        // Also runs when Create/Open acquired a remote handle but a later
+        // metadata or bookkeeping step failed before WinFsp accepted Context.
+        let mut file = self.tracked.file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = file.take()
+            && let Err(error) = self.pipe.call(Operation::Close { handle })
+        {
+            let message = format!("Remote file close was not confirmed: {error}");
+            eprintln!("{message}");
+            let _ = self.pipe.call(Operation::Report {
+                event: BridgeEvent::Warning { message },
+            });
+        }
+        drop(file);
+        let directory = self.directory.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = directory.handle.take()
+            && let Err(error) = self.pipe.call(Operation::CloseDirectory { handle })
+        {
+            let message = format!("Remote directory close was not confirmed: {error}");
+            eprintln!("{message}");
+            let _ = self.pipe.call(Operation::Report {
+                event: BridgeEvent::Warning { message },
+            });
+        }
+    }
 }
 impl Fs {
     fn warn(&self, message: String) {
@@ -134,8 +164,12 @@ impl Fs {
         } else {
             // Attribute-only handles need a remote read handle for fstat and
             // stable object identity; the account still controls access.
-            let write = access & (0x2 | 0x4 | 0x100) != 0;
-            let read = access & 0x1 != 0 || !write;
+            let requested_write = access & (0x2 | 0x4 | 0x100) != 0;
+            // Creating an empty file requires write on the SFTP handle even if
+            // the caller requested only read/attribute access. WinFsp enforces
+            // the caller's GrantedAccess; the root must still permit writes.
+            let write = requested_write || create != FsCreate::OpenExisting;
+            let read = access & 0x1 != 0 || !requested_write;
             match self.call(Operation::Open {
                 path: path.clone(),
                 options: FsOpenOptions {
@@ -149,9 +183,15 @@ impl Fs {
                 _ => return Err(invalid()),
             }
         };
-        Ok(Context {
+        let path = Arc::new(Mutex::new(path));
+        let tracked = Arc::new(crate::windows_handles::OpenHandle {
+            path: path.clone(),
+            file: Mutex::new(file),
+            writable: access & (0x2 | 0x4 | 0x100) != 0 || create != FsCreate::OpenExisting,
+        });
+        let context = Context {
             _open: open,
-            path: Mutex::new(path),
+            path,
             file,
             directory: Mutex::new(Directory {
                 handle: None,
@@ -160,7 +200,11 @@ impl Fs {
                 eof: false,
             }),
             is_dir,
-        })
+            tracked,
+            pipe: self.pipe.clone(),
+        };
+        self.handles.register(&context.tracked).map_err(failure)?;
+        Ok(context)
     }
 }
 impl FileSystemContext for Fs {
@@ -231,18 +275,7 @@ impl FileSystemContext for Fs {
         Ok(context)
     }
     fn close(&self, context: Context) {
-        if let Some(handle) = context.file {
-            if let Err(error) = self.call(Operation::Close { handle }) {
-                self.warn(format!("Remote file close was not confirmed: {error}"));
-            }
-        }
-        if let Ok(directory) = context.directory.into_inner() {
-            if let Some(handle) = directory.handle {
-                if let Err(error) = self.call(Operation::CloseDirectory { handle }) {
-                    self.warn(format!("Remote directory close was not confirmed: {error}"));
-                }
-            }
-        }
+        drop(context);
     }
     fn get_file_info(&self, context: &Context, info: &mut FileInfo) -> winfsp::Result<()> {
         fill(info, &self.metadata(context)?);
@@ -307,6 +340,10 @@ impl FileSystemContext for Fs {
                 self.call(Operation::Flush { handle })?;
             }
             fill(info, &self.metadata(context)?);
+        } else {
+            self.handles
+                .flush(|handle| self.pipe.call(Operation::Flush { handle }).map(|_| ()))
+                .map_err(failure)?;
         }
         Ok(())
     }
@@ -371,19 +408,24 @@ impl FileSystemContext for Fs {
     }
     fn rename(
         &self,
-        context: &Context,
+        _context: &Context,
         old: &U16CStr,
         new: &U16CStr,
         replace: bool,
     ) -> winfsp::Result<()> {
         let to = path(new)?;
-        self.call(Operation::Rename {
-            from: path(old)?,
-            to: to.clone(),
-            replace,
-        })?;
-        *lock(&context.path)? = to;
-        Ok(())
+        let from = path(old)?;
+        self.handles
+            .rename(&from, &to, || {
+                self.pipe
+                    .call(Operation::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                        replace,
+                    })
+                    .map(|_| ())
+            })
+            .map_err(failure)
     }
     fn set_delete(&self, context: &Context, _: &U16CStr, delete: bool) -> winfsp::Result<()> {
         if delete {
@@ -414,15 +456,15 @@ impl FileSystemContext for Fs {
             let target = name
                 .map(path)
                 .unwrap_or_else(|| lock(&context.path).map(|p| p.clone()));
-            if let Ok(path) = target {
-                if let Err(e) = self.call(Operation::Remove {
+            if let Ok(path) = target
+                && let Err(e) = self.call(Operation::Remove {
                     path,
                     directory: context.is_dir,
-                }) {
-                    self.warn(format!(
-                        "Remote deletion failed during Windows cleanup: {e}"
-                    ));
-                }
+                })
+            {
+                self.warn(format!(
+                    "Remote deletion failed during Windows cleanup: {e}"
+                ));
             }
         }
     }
@@ -550,6 +592,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
     let mut host = FileSystemHost::<_, winfsp::host::CoarseGuard>::new(
         params,
         Fs {
+            handles: crate::windows_handles::OpenHandles::default(),
             gate: gate.clone(),
             pipe: pipe.clone(),
             caps,
