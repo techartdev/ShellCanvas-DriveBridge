@@ -138,8 +138,7 @@ pub struct FsOpenOptions {
 }
 impl FsOpenOptions {
     pub fn validate(self) -> FsResult<()> {
-        if !self.write && (!self.read || self.truncate || self.create != FsCreate::OpenExisting)
-        {
+        if !self.write && (!self.read || self.truncate || self.create != FsCreate::OpenExisting) {
             return Err(FsError::new(
                 FsErrorKind::InvalidInput,
                 "Invalid file open options",
@@ -177,6 +176,10 @@ pub trait MountedDirectory: Send {
 }
 #[async_trait]
 pub trait MountedFileSystem: Send + Sync {
+    /// Cheap lifecycle check, including heartbeats that perform no file I/O.
+    fn check_available(&self) -> FsResult<()> {
+        Ok(())
+    }
     fn capabilities(&self) -> FsCapabilities;
     async fn space(&self, _path: &MountPath) -> FsResult<FsSpace> {
         Err(FsError::new(

@@ -15,6 +15,19 @@ mod windows;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.len() == 2 && args[1] == "--licenses" {
+        println!(
+            "ShellCanvas Drive Bridge: GPL-3.0-only. Free software; commercial use is permitted under its license.\n\n{}",
+            include_str!("../THIRD-PARTY.md")
+        );
+        return Ok(());
+    }
+    if args.len() == 2 && (args[1] == "--help" || args[1] == "-h") {
+        println!(
+            "ShellCanvas Drive Bridge (development preview)\n\nAttach a selected ShellCanvas folder through your operating system's filesystem interface.\n\nLaunch mappings from ShellCanvas. Driver installation is separate:\n  Windows: WinFsp\n  Linux: FUSE and the distribution's mount helper\n  macOS: macFUSE\n\n--licenses  Show licensing and third-party notices\n--mount LOCAL_TARGET  Use a root grant supplied over inherited pipes\n\nSource and installation status: https://github.com/techartdev/ShellCanvas-DriveBridge"
+        );
+        return Ok(());
+    }
     if args.len() == 2 && args[1] == "--verify-transport" {
         return probe::run(Client::new(std::io::stdin(), std::io::stdout()));
     }

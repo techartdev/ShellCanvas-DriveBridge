@@ -4,12 +4,12 @@ An optional, free native app for attaching a folder from a ShellCanvas file
 provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
-**Development preview — not an end-user release yet.** The Windows backend builds,
-the Linux FUSE backend passes a cross-target compile check, and the separate
-process protocol has passed a live SFTP read/write test. Native mounted-drive
-acceptance, macOS builds, the ShellCanvas attachment UI, installation and graceful
-detach integration are still in progress. Do not treat compilation as verified
-filesystem compatibility.
+**Development preview — not an end-user release yet.** Windows, Linux and macOS
+builds pass in CI. A native Linux mount has passed live SFTP file-operation
+checks, and the Windows executable has passed the separate-process SFTP protocol
+test. Windows/macOS native mount acceptance, the ShellCanvas attachment UI,
+installation and graceful busy-detach integration are still in progress.
+Do not treat compilation as verified filesystem compatibility.
 
 ## Architecture
 
@@ -31,8 +31,8 @@ protocol. Simple ShellCanvas adapters need not implement mounting.
 | Client | Native integration | Current verification |
 | --- | --- | --- |
 | Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Executable builds; native mount test pending |
-| Linux | FUSE kernel interface and the distribution's mount helper | x86_64 compile check passes; native mount test pending |
-| macOS | Separately installed [macFUSE](https://macfuse.github.io/) | Backend shares the FUSE implementation; macOS build and runtime verification pending |
+| Linux | FUSE kernel interface and the distribution's mount helper | Native x86_64 mount: real SFTP offset I/O, truncate, replacement saves, directory paging, rename with an open file and capacity checks pass |
+| macOS | Separately installed [macFUSE](https://macfuse.github.io/) | macOS 14 CI build passes; native mount verification pending |
 
 Modern supported systems are the target. The current macFUSE release requires
 macOS 12+. This Rust FUSE backend uses the kernel/libfuse interface; macFUSE's
@@ -62,6 +62,8 @@ The executable is launched by ShellCanvas with inherited request/reply pipes:
 
 ```text
 shellcanvas-drive-bridge --mount LOCAL_TARGET
+shellcanvas-drive-bridge --help
+shellcanvas-drive-bridge --licenses
 ```
 
 It is not a standalone SSH client. Launching that command from an ordinary

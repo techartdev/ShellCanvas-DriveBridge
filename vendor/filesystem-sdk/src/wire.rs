@@ -193,7 +193,10 @@ impl Server {
     }
     pub async fn dispatch(&mut self, operation: Operation) -> FsResult<Value> {
         match operation {
-            Operation::Capabilities => return Ok(Value::Capabilities(self.fs.capabilities())),
+            Operation::Capabilities => {
+                self.fs.check_available()?;
+                return Ok(Value::Capabilities(self.fs.capabilities()));
+            }
             Operation::Space { path } => return Ok(Value::Space(self.fs.space(&path).await?)),
             Operation::Metadata { path } => {
                 return Ok(Value::Metadata(self.fs.metadata(&path).await?))
@@ -290,12 +293,31 @@ impl Server {
         Ok(Value::Unit)
     }
     pub async fn close(&mut self) {
-        for (_, file) in self.files.drain() {
-            let _ = tokio::time::timeout(REQUEST_TIMEOUT, file.close()).await;
-        }
-        for (_, mut dir) in self.directories.drain() {
-            let _ = tokio::time::timeout(REQUEST_TIMEOUT, dir.directory.close()).await;
-        }
+        // Bound the whole teardown, not each handle serially. A disconnected
+        // server with many open files must not hold shutdown for hours.
+        let files = std::mem::take(&mut self.files);
+        let directories = std::mem::take(&mut self.directories);
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, async move {
+            let mut closing = tokio::task::JoinSet::new();
+            for file in files.into_values() {
+                if closing.len() == 16 {
+                    let _ = closing.join_next().await;
+                }
+                closing.spawn(async move {
+                    let _ = file.close().await;
+                });
+            }
+            for mut dir in directories.into_values() {
+                if closing.len() == 16 {
+                    let _ = closing.join_next().await;
+                }
+                closing.spawn(async move {
+                    let _ = dir.directory.close().await;
+                });
+            }
+            while closing.join_next().await.is_some() {}
+        })
+        .await;
     }
     pub async fn serve(
         mut self,
@@ -319,15 +341,24 @@ impl Server {
                         "Filesystem request timed out; attachment is being retired",
                     ))
                 });
-                write_frame_async(
-                    &mut writer,
-                    &Response {
-                        version: PROTOCOL,
-                        id: request.id,
-                        result,
-                    },
+                tokio::time::timeout(
+                    REQUEST_TIMEOUT,
+                    write_frame_async(
+                        &mut writer,
+                        &Response {
+                            version: PROTOCOL,
+                            id: request.id,
+                            result,
+                        },
+                    ),
                 )
-                .await?;
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Bridge stopped reading filesystem replies",
+                    )
+                })??;
                 if timed_out {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
