@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//! Real WinFsp callbacks against a disposable local provider. No SSH credentials
+//! or normal ShellCanvas profile; this tests the bridge, not SFTP or the desktop UI.
+#![cfg(windows)]
+use anyhow::{Context, Result, ensure};
+use async_trait::async_trait;
+use shellcanvas_filesystem_sdk::{
+    bridge_control::{BridgeControl, BridgePhase},
+    wire::Server,
+    *,
+};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::{Duration, UNIX_EPOCH},
+};
+
+fn error(e: std::io::Error) -> FsError {
+    use std::io::ErrorKind::*;
+    let kind = match e.kind() {
+        NotFound => FsErrorKind::NotFound,
+        PermissionDenied => FsErrorKind::PermissionDenied,
+        AlreadyExists => FsErrorKind::AlreadyExists,
+        NotADirectory => FsErrorKind::NotDirectory,
+        IsADirectory => FsErrorKind::IsDirectory,
+        DirectoryNotEmpty => FsErrorKind::NotEmpty,
+        InvalidInput => FsErrorKind::InvalidInput,
+        _ => FsErrorKind::Io,
+    };
+    FsError::new(kind, e.to_string())
+}
+fn metadata(m: fs::Metadata) -> FsMetadata {
+    FsMetadata {
+        kind: if m.is_dir() {
+            FsKind::Directory
+        } else {
+            FsKind::File
+        },
+        size: m.len(),
+        accessed: m
+            .accessed()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()),
+        modified: m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()),
+        permissions: None,
+    }
+}
+fn set(file: &fs::File, m: FsSetMetadata) -> std::io::Result<()> {
+    if let Some(size) = m.size {
+        file.set_len(size)?;
+    }
+    if m.accessed.is_some() || m.modified.is_some() {
+        let mut times = fs::FileTimes::new();
+        if let Some(t) = m.accessed {
+            times = times.set_accessed(UNIX_EPOCH + Duration::from_secs(t));
+        }
+        if let Some(t) = m.modified {
+            times = times.set_modified(UNIX_EPOCH + Duration::from_secs(t));
+        }
+        file.set_times(times)?;
+    }
+    Ok(())
+}
+struct LocalFile(Mutex<Option<fs::File>>);
+impl LocalFile {
+    fn with<T>(&self, op: impl FnOnce(&mut fs::File) -> std::io::Result<T>) -> FsResult<T> {
+        let mut guard = self.0.lock().unwrap();
+        let file = guard
+            .as_mut()
+            .ok_or_else(|| FsError::new(FsErrorKind::Offline, "Fixture handle closed"))?;
+        op(file).map_err(error)
+    }
+}
+#[async_trait]
+impl MountedFile for LocalFile {
+    async fn metadata(&self) -> FsResult<FsMetadata> {
+        self.with(|f| f.metadata().map(metadata))
+    }
+    async fn read_at(&self, offset: u64, length: u32) -> FsResult<Vec<u8>> {
+        self.with(|f| {
+            f.seek(SeekFrom::Start(offset))?;
+            let mut data = vec![0; length as usize];
+            let n = f.read(&mut data)?;
+            data.truncate(n);
+            Ok(data)
+        })
+    }
+    async fn write_at(&self, offset: u64, bytes: &[u8]) -> FsResult<()> {
+        self.with(|f| {
+            f.seek(SeekFrom::Start(offset))?;
+            f.write_all(bytes)
+        })
+    }
+    async fn set_metadata(&self, m: FsSetMetadata) -> FsResult<()> {
+        self.with(|f| set(f, m))
+    }
+    async fn flush(&self) -> FsResult<()> {
+        self.with(|f| f.sync_all())
+    }
+    async fn close(&self) -> FsResult<()> {
+        self.0.lock().unwrap().take();
+        Ok(())
+    }
+}
+struct LocalDirectory(Option<fs::ReadDir>);
+#[async_trait]
+impl MountedDirectory for LocalDirectory {
+    async fn next(&mut self) -> FsResult<Vec<FsDirectoryEntry>> {
+        self.0
+            .as_mut()
+            .ok_or_else(|| FsError::new(FsErrorKind::Offline, "Fixture directory closed"))?
+            .take(7)
+            .map(|entry| {
+                let entry = entry.map_err(error)?;
+                Ok(FsDirectoryEntry {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    metadata: metadata(entry.metadata().map_err(error)?),
+                })
+            })
+            .collect()
+    }
+    async fn close(&mut self) -> FsResult<()> {
+        self.0.take();
+        Ok(())
+    }
+}
+struct LocalRoot(PathBuf);
+impl LocalRoot {
+    fn path(&self, path: &MountPath) -> PathBuf {
+        path.components()
+            .iter()
+            .fold(self.0.clone(), |p, part| p.join(part))
+    }
+}
+#[async_trait]
+impl MountedFileSystem for LocalRoot {
+    fn capabilities(&self) -> FsCapabilities {
+        FsCapabilities {
+            writable: true,
+            atomic_replace: true,
+            durable_flush: true,
+        }
+    }
+    async fn space(&self, _: &MountPath) -> FsResult<FsSpace> {
+        Ok(FsSpace {
+            block_size: 4096,
+            blocks: 1_000_000,
+            blocks_free: 800_000,
+            blocks_available: 750_000,
+            files: 0,
+            files_free: 0,
+            name_max: 255,
+        })
+    }
+    async fn metadata(&self, path: &MountPath) -> FsResult<FsMetadata> {
+        fs::metadata(self.path(path)).map(metadata).map_err(error)
+    }
+    async fn open(
+        &self,
+        path: &MountPath,
+        options: FsOpenOptions,
+    ) -> FsResult<Arc<dyn MountedFile>> {
+        options.validate()?;
+        if path.components().last().is_some_and(|p| p == "denied.txt") {
+            return Err(FsError::new(
+                FsErrorKind::PermissionDenied,
+                "Fixture denies this file",
+            ));
+        }
+        let mut file = fs::OpenOptions::new();
+        file.read(options.read)
+            .write(options.write)
+            .truncate(options.truncate);
+        match options.create {
+            FsCreate::OpenExisting => {}
+            FsCreate::CreateNew => {
+                file.create_new(true);
+            }
+            FsCreate::OpenOrCreate => {
+                file.create(true);
+            }
+        }
+        Ok(Arc::new(LocalFile(Mutex::new(Some(
+            file.open(self.path(path)).map_err(error)?,
+        )))))
+    }
+    async fn open_directory(&self, path: &MountPath) -> FsResult<Box<dyn MountedDirectory>> {
+        Ok(Box::new(LocalDirectory(Some(
+            fs::read_dir(self.path(path)).map_err(error)?,
+        ))))
+    }
+    async fn set_metadata(&self, path: &MountPath, m: FsSetMetadata) -> FsResult<()> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(self.path(path))
+            .map_err(error)?;
+        set(&file, m).map_err(error)
+    }
+    async fn mkdir(&self, path: &MountPath) -> FsResult<()> {
+        fs::create_dir(self.path(path)).map_err(error)
+    }
+    async fn remove(&self, path: &MountPath, directory: bool) -> FsResult<()> {
+        if directory {
+            fs::remove_dir(self.path(path))
+        } else {
+            fs::remove_file(self.path(path))
+        }
+        .map_err(error)
+    }
+    async fn rename(&self, from: &MountPath, to: &MountPath, replace: bool) -> FsResult<()> {
+        let to = self.path(to);
+        if !replace && to.exists() {
+            return Err(FsError::new(
+                FsErrorKind::AlreadyExists,
+                "Fixture destination exists",
+            ));
+        }
+        fs::rename(self.path(from), to).map_err(error)
+    }
+}
+
+async fn phase(control: &BridgeControl, expected: BridgePhase) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let state = control.snapshot()?;
+            if state.phase == expected {
+                return Ok(());
+            }
+            ensure!(
+                state.phase != BridgePhase::Failed,
+                "Bridge failed: {:?}",
+                state.message
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("Bridge lifecycle deadline")?
+}
+fn exercise(target: &Path, source: &Path) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(target.join("seek.bin"))?;
+    file.write_all(b"begin")?;
+    file.seek(SeekFrom::Start((1 << 32) + 19))?;
+    file.write_all(b"end")?;
+    file.sync_all()?;
+    ensure!(
+        file.metadata()?.len() == (1 << 32) + 22,
+        "Sparse size mismatch"
+    );
+    file.set_len(5)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    ensure!(bytes == b"begin", "Truncate/read mismatch");
+    drop(file);
+    fs::write(target.join("save.tmp"), b"replacement")?;
+    fs::rename(target.join("save.tmp"), target.join("seek.bin"))?;
+    ensure!(
+        fs::read(source.join("seek.bin"))? == b"replacement",
+        "Replace did not reach provider"
+    );
+    fs::create_dir(target.join("directory"))?;
+    for i in 0..70 {
+        fs::write(target.join("directory").join(format!("item-{i:03}")), [i])?;
+    }
+    for _ in 0..2 {
+        ensure!(
+            fs::read_dir(target.join("directory"))?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .len()
+                == 70,
+            "Directory paging lost entries"
+        );
+    }
+    fs::rename(target.join("directory"), target.join("renamed"))?;
+    ensure!(
+        fs::read(target.join("renamed/item-000"))? == [0],
+        "Directory rename failed"
+    );
+    ensure!(
+        fs::remove_dir(target.join("renamed")).is_err(),
+        "Nonempty directory removed"
+    );
+    let missing = fs::read(target.join("missing")).unwrap_err();
+    ensure!(
+        missing.kind() == std::io::ErrorKind::NotFound,
+        "Missing-file status mismatch: {missing}"
+    );
+    let denied = fs::File::open(target.join("denied.txt")).unwrap_err();
+    ensure!(
+        denied.kind() == std::io::ErrorKind::PermissionDenied,
+        "Permission status mismatch: {denied}"
+    );
+    fs::remove_file(target.join("renamed/item-000"))?;
+    ensure!(
+        !source.join("renamed/item-000").exists(),
+        "Delete did not reach provider"
+    );
+    println!(
+        "NATIVE_WINDOWS_IO_PASS: create, offsets above 4 GiB, flush, truncate, replacement save, directory paging/rename, deletion and errors"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Requires installed WinFsp and SHELLCANVAS_NATIVE_WINDOWS_TEST=1. Uses an unused drive letter and disposable backing files."]
+async fn native_windows_mount() -> Result<()> {
+    ensure!(
+        std::env::var("SHELLCANVAS_NATIVE_WINDOWS_TEST").as_deref() == Ok("1"),
+        "Explicit native-test opt-in required"
+    );
+    let drives = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+    ensure!(drives != 0, "Cannot enumerate local drives");
+    let letter = (b'D'..=b'Z')
+        .rev()
+        .find(|c| drives & (1 << (c - b'A')) == 0)
+        .context("No free test drive")?;
+    let mount = format!("{}:", letter as char);
+    let target = PathBuf::from(format!("{mount}\\"));
+    let backing = tempfile::tempdir()?;
+    fs::write(backing.path().join("denied.txt"), b"fixture")?;
+    let control = Arc::new(BridgeControl::default());
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shellcanvas-drive-bridge"))
+        .args(["--mount", &mount])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
+    let serving = tokio::spawn(
+        Server::with_control(
+            Arc::new(LocalRoot(backing.path().to_owned())),
+            control.clone(),
+        )
+        .serve(child.stdout.take().unwrap(), child.stdin.take().unwrap()),
+    );
+    let result: Result<()> = async {
+        phase(&control, BridgePhase::Attached).await?;
+        let p = target.clone(); let source = backing.path().to_owned();
+        tokio::task::spawn_blocking(move || exercise(&p, &source)).await??;
+        let held = fs::File::open(target.join("seek.bin"))?;
+        control.request_detach()?;
+        phase(&control, BridgePhase::Attached).await?;
+        ensure!(control.snapshot()?.message.is_some(), "Busy detach had no explanation");
+        ensure!(target.exists(), "Busy attachment disappeared");
+        drop(held);
+        control.request_detach()?;
+        phase(&control, BridgePhase::Detached).await?;
+        ensure!(tokio::time::timeout(Duration::from_secs(10), child.wait()).await??.success(), "Bridge exit failed");
+        ensure!(unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() } & (1 << (letter - b'A')) == 0, "Drive remained after detach");
+        println!("NATIVE_WINDOWS_DETACH_PASS: busy file preserved mapping; ordinary detach removed drive after close");
+        Ok(())
+    }.await;
+    if result.is_err() {
+        let _ = child.kill().await;
+    }
+    serving.abort();
+    let _ = serving.await;
+    result
+}
