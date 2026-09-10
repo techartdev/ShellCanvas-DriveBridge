@@ -171,6 +171,16 @@ Non-root helper fallback and modern macOS failure cleanup remain unverified.
 ShellCanvas retains failed mappings for
 inspection and verifies the OS mount table before releasing cleanup ownership.
 
+At `87a28c9`, directory rewind recovery clears retired remote handles and buffered
+entries before reopening, including failures followed by a seek to a later
+position. Linux/macOS regression tests cover close/reopen failures and invalid
+replies; all platform jobs pass in [CI run 34519068114](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34519068114).
+The Linux artifact also passes native Linux 6.8 testing through the core SFTP
+provider: repeated rewinds of the same directory descriptor return exact paged
+contents, including after renaming the open directory. The earlier I/O, mmap and
+busy-detach checks pass, with independently confirmed fixture/mount cleanup.
+This does not establish native injected-failure or non-root acceptance.
+
 ## Licensing and commercial distribution
 
 Drive Bridge is **GPL-3.0-only**, reflecting its use of the GPL-licensed
