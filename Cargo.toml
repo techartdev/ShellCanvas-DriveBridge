@@ -1,0 +1,21 @@
+[package]
+name = "shellcanvas-drive-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Optional native filesystem bridge for ShellCanvas"
+
+[workspace]
+
+[dependencies]
+shellcanvas-filesystem-sdk = { path = "vendor/filesystem-sdk" }
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13.1", default-features = false, features = ["delayload"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader"] }
+windows-registry = "0.6"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+fuser = "0.18"
+libc = "0.2"

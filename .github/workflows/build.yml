@@ -1,0 +1,36 @@
+name: Native bridge builds
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Windows binding generator
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install libclang==18.1.1
+          $clang = python -c "import clang.cindex; print(clang.cindex.Config.library_path)"
+          "LIBCLANG_PATH=$clang" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: macOS build headers and library
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config
+          brew install --cask macfuse
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drive-bridge-${{ runner.os }}
+          path: |
+            target/debug/shellcanvas-drive-bridge
+            target/debug/shellcanvas-drive-bridge.exe
+          if-no-files-found: error
