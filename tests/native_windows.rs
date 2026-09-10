@@ -577,6 +577,35 @@ fn file_times(target: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn nt_overwrite(path: &Path, attributes: u32) -> Result<fs::File> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows::{core::PWSTR, Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::*},
+        Win32::{Foundation::*, Storage::FileSystem::*, System::IO::IO_STATUS_BLOCK}};
+    let mut name = std::ffi::OsString::from(r"\??\");
+    name.push(path);
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    let name = UNICODE_STRING {
+        Length: u16::try_from(wide.len() * 2)?,
+        MaximumLength: u16::try_from(wide.len() * 2)?,
+        Buffer: PWSTR(wide.as_mut_ptr()),
+    };
+    let object = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        ..Default::default()
+    };
+    let mut handle = HANDLE::default();
+    let mut status = IO_STATUS_BLOCK::default();
+    // FILE_OVERWRITE + synchronous non-directory I/O. Unlike the Rust standard
+    // library's reopen/truncate path, this actually supplies overwrite attributes.
+    let result = unsafe { NtCreateFile(&mut handle, FILE_GENERIC_WRITE, &object, &mut status,
+        None, FILE_FLAGS_AND_ATTRIBUTES(attributes), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OVERWRITE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, None, 0) };
+    result.ok().context("NtCreateFile FILE_OVERWRITE")?;
+    Ok(unsafe { fs::File::from_raw_handle(handle.0) })
+}
+
 fn creation_attributes(target: &Path, source: &Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
@@ -599,11 +628,9 @@ fn creation_attributes(target: &Path, source: &Path) -> Result<()> {
     ensure!(!source.join("unsupported-create.txt").exists(), "Rejected creation left a backing file");
 
     fs::write(&path, b"keep existing bytes")?;
-    ensure!(fs::OpenOptions::new().write(true).create(true).truncate(true)
-        .attributes(FILE_ATTRIBUTE_HIDDEN.0).open(&path).is_err(), "Unsupported overwrite falsely succeeded");
+    ensure!(nt_overwrite(&path, FILE_ATTRIBUTE_HIDDEN.0).is_err(), "Unsupported overwrite falsely succeeded");
     ensure!(fs::read(&backing)? == b"keep existing bytes", "Rejected overwrite truncated its destination");
-    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true)
-        .attributes(FILE_ATTRIBUTE_READONLY.0).open(&path)?;
+    let mut file = nt_overwrite(&path, FILE_ATTRIBUTE_READONLY.0)?;
     file.write_all(b"replacement")?;
     file.sync_all()?;
     drop(file);
@@ -612,6 +639,23 @@ fn creation_attributes(target: &Path, source: &Path) -> Result<()> {
     unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
     fs::remove_file(&path)?;
     println!("NATIVE_WINDOWS_CREATE_ATTRIBUTES_PASS: create/overwrite preserve read-only while initial handles remain writable; unsupported attributes do not create or truncate files");
+    Ok(())
+}
+
+#[test]
+fn native_overwrite_api_baseline() -> Result<()> {
+    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    let local = tempfile::tempdir()?;
+    let path = local.path().join("overwrite-baseline.txt");
+    fs::write(&path, b"before")?;
+    let mut file = nt_overwrite(&path, FILE_ATTRIBUTE_READONLY.0)?;
+    file.write_all(b"after")?;
+    file.sync_all()?;
+    drop(file);
+    let readonly = fs::metadata(&path)?.permissions().readonly();
+    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    ensure!(readonly, "Native API baseline did not apply overwrite attributes");
+    ensure!(fs::read(&path)? == b"after", "Native API baseline lost overwritten bytes");
     Ok(())
 }
 
