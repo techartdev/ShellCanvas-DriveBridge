@@ -205,6 +205,19 @@ The core's `native_bridge_probe` has an opt-in
 with `SHELLCANVAS_PROBE_TRANSPORT_LOSS=1` for pipe-loss acceptance. This result is
 specific to that Linux/runtime combination, not a guarantee for every distribution.
 
+Inode lifetime regressions pass at `558d1f2` in
+[CI run 34521983619](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34521983619).
+They cover both orders of releasing kernel references and open handles, and
+ensure retiring an old inode cannot remove a recreated path. Its Linux artifact
+also passes native Linux 6.8 acceptance as UID 65534 through the core SFTP
+provider: unlink/recreate gives a distinct inode, the old open descriptor keeps
+reading/writing its original object, and closing it leaves the replacement
+unchanged. The source owner independently verifies replacement bytes. Earlier
+directory rewind, mmap, busy detach and ordinary unmount checks pass; fixture,
+mount and staged binary removal were independently confirmed. All platform CI
+jobs and native Windows checks pass. Concurrent edits by another remote client
+remain outside this evidence.
+
 ## Licensing and commercial distribution
 
 Drive Bridge is **GPL-3.0-only**, reflecting its use of the GPL-licensed
