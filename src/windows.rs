@@ -93,6 +93,12 @@ struct Fs {
     caps: FsCapabilities,
 }
 impl Fs {
+    fn warn(&self, message: String) {
+        eprintln!("{message}");
+        let _ = self.pipe.call(Operation::Report {
+            event: BridgeEvent::Warning { message },
+        });
+    }
     fn call(&self, operation: Operation) -> winfsp::Result<Value> {
         self.pipe.call(operation).map_err(failure)
     }
@@ -226,11 +232,15 @@ impl FileSystemContext for Fs {
     }
     fn close(&self, context: Context) {
         if let Some(handle) = context.file {
-            let _ = self.call(Operation::Close { handle });
+            if let Err(error) = self.call(Operation::Close { handle }) {
+                self.warn(format!("Remote file close was not confirmed: {error}"));
+            }
         }
         if let Ok(directory) = context.directory.into_inner() {
             if let Some(handle) = directory.handle {
-                let _ = self.call(Operation::CloseDirectory { handle });
+                if let Err(error) = self.call(Operation::CloseDirectory { handle }) {
+                    self.warn(format!("Remote directory close was not confirmed: {error}"));
+                }
             }
         }
     }
@@ -409,7 +419,9 @@ impl FileSystemContext for Fs {
                     path,
                     directory: context.is_dir,
                 }) {
-                    eprintln!("Remote deletion failed during Windows cleanup: {e}");
+                    self.warn(format!(
+                        "Remote deletion failed during Windows cleanup: {e}"
+                    ));
                 }
             }
         }

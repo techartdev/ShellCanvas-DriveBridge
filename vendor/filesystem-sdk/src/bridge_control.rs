@@ -70,6 +70,12 @@ impl BridgeControl {
     }
     pub fn poll(&self) -> FsResult<BridgeDirective> {
         let mut state = self.state()?;
+        if matches!(
+            state.snapshot.phase,
+            BridgePhase::Failed | BridgePhase::Detached
+        ) {
+            return Err(FsError::new(FsErrorKind::Offline, "Attachment is retired"));
+        }
         Ok(if std::mem::take(&mut state.pending) {
             BridgeDirective::Detach
         } else {
@@ -88,7 +94,9 @@ impl BridgeControl {
                     BridgePhase::Attached | BridgePhase::Detaching
                 ) =>
             {
-                state.snapshot.phase = BridgePhase::Detached
+                state.snapshot.phase = BridgePhase::Detached;
+                state.snapshot.message = None;
+                state.pending = false;
             }
             BridgeEvent::DetachFailed { message }
                 if state.snapshot.phase == BridgePhase::Detaching =>
