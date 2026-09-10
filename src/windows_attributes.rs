@@ -6,6 +6,27 @@ const READONLY: u32 = 0x1;
 const DIRECTORY: u32 = 0x10;
 const NORMAL: u32 = 0x80;
 
+/// Windows may supply ARCHIVE when creating/overwriting ordinary files. The
+/// portable provider has no backup-archive state; do not turn that advisory bit
+/// into a failure for ordinary saves, or pretend it is persisted on readback.
+pub fn creation_attributes(requested: u32, directory: bool) -> FsResult<u32> {
+    let requested = requested & !0x20;
+    validate_attributes(requested)?;
+    if directory && requested & READONLY != 0 {
+        return Err(unsupported("Read-only creation is supported only for regular files"));
+    }
+    Ok(requested)
+}
+
+fn validate_attributes(requested: u32) -> FsResult<()> {
+    if requested & !(READONLY | DIRECTORY | NORMAL) != 0 {
+        return Err(unsupported(
+            "This provider cannot persist Windows hidden, system, archive or other DOS attributes",
+        ));
+    }
+    Ok(())
+}
+
 pub fn attributes(meta: &FsMetadata) -> u32 {
     if meta.kind == FsKind::Directory {
         DIRECTORY
@@ -21,11 +42,7 @@ pub fn permissions(meta: &FsMetadata, requested: u32) -> FsResult<Option<u32>> {
     if requested == u32::MAX {
         return Ok(None);
     }
-    if requested & !(READONLY | DIRECTORY | NORMAL) != 0 {
-        return Err(unsupported(
-            "This provider cannot persist Windows hidden, system, archive or other DOS attributes",
-        ));
-    }
+    validate_attributes(requested)?;
     let readonly = requested & READONLY != 0;
     if meta.kind != FsKind::File {
         return if readonly {

@@ -573,12 +573,50 @@ fn file_times(target: &Path, source: &Path) -> Result<()> {
         "Bundled metadata-change time prevented supported modification time");
     drop(file);
     fs::remove_file(&path)?;
-    println!("NATIVE_WINDOWS_TIMES_PASS: access/modification times reach source through attribute-only handle; unavailable times stay absent; unsupported mixed requests have no partial effects");
+    println!("NATIVE_WINDOWS_TIMES_PASS: supported times reach source, including bundled change-time requests; unavailable times stay absent; unsupported creation/pre-epoch requests have no partial effects");
+    Ok(())
+}
+
+fn creation_attributes(target: &Path, source: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    let path = target.join("created-readonly.txt");
+    let backing = source.join("created-readonly.txt");
+    let mut file = fs::OpenOptions::new().write(true).create_new(true)
+        .attributes(FILE_ATTRIBUTE_READONLY.0).open(&path)?;
+    file.write_all(b"initial writer")?;
+    file.sync_all()?;
+    drop(file);
+    ensure!(fs::metadata(&backing)?.permissions().readonly(), "Creation lost read-only flag");
+    ensure!(fs::read(&backing)? == b"initial writer", "Read-only creation prevented its initial writer");
+    ensure!(fs::OpenOptions::new().write(true).open(&path).is_err(), "Read-only creation allowed a later writer");
+    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    fs::remove_file(&path)?;
+
+    let unsupported_path = target.join("unsupported-create.txt");
+    ensure!(fs::OpenOptions::new().write(true).create_new(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN.0).open(&unsupported_path).is_err(), "Unsupported creation falsely succeeded");
+    ensure!(!source.join("unsupported-create.txt").exists(), "Rejected creation left a backing file");
+
+    fs::write(&path, b"keep existing bytes")?;
+    ensure!(fs::OpenOptions::new().write(true).create(true).truncate(true)
+        .attributes(FILE_ATTRIBUTE_HIDDEN.0).open(&path).is_err(), "Unsupported overwrite falsely succeeded");
+    ensure!(fs::read(&backing)? == b"keep existing bytes", "Rejected overwrite truncated its destination");
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true)
+        .attributes(FILE_ATTRIBUTE_READONLY.0).open(&path)?;
+    file.write_all(b"replacement")?;
+    file.sync_all()?;
+    drop(file);
+    ensure!(fs::metadata(&backing)?.permissions().readonly(), "Overwrite lost read-only flag");
+    ensure!(fs::read(&backing)? == b"replacement", "Overwrite did not replace exact bytes");
+    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    fs::remove_file(&path)?;
+    println!("NATIVE_WINDOWS_CREATE_ATTRIBUTES_PASS: create/overwrite preserve read-only while initial handles remain writable; unsupported attributes do not create or truncate files");
     Ok(())
 }
 
 fn native_copy(target: &Path, source: &Path) -> Result<()> {
-    use windows::{core::HSTRING, Win32::Storage::FileSystem::CopyFileW};
+    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
     let local = tempfile::tempdir()?;
     let input = local.path().join("local-input.txt");
     let output = local.path().join("local-output.txt");
@@ -601,6 +639,14 @@ fn native_copy(target: &Path, source: &Path) -> Result<()> {
     unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), false) }
         .context("Native CopyFileW replacing an existing mounted file")?;
     ensure!(fs::read(source.join("copied.txt"))? == b"overwrite via native copy", "Native copy overwrite lost data");
+    fs::remove_file(&mounted)?;
+    unsafe { SetFileAttributesW(&HSTRING::from(input.as_os_str()), FILE_ATTRIBUTE_READONLY)?; }
+    unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), true) }
+        .context("Native CopyFileW copying a read-only source")?;
+    ensure!(fs::metadata(source.join("copied.txt"))?.permissions().readonly(), "Native copy lost source read-only attribute");
+    ensure!(fs::read(source.join("copied.txt"))? == b"overwrite via native copy", "Read-only native copy lost data");
+    unsafe { SetFileAttributesW(&HSTRING::from(input.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    unsafe { SetFileAttributesW(&HSTRING::from(mounted.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
     fs::remove_file(&mounted)?;
     println!("NATIVE_WINDOWS_COPY_PASS: CopyFileW transfers both directions, preserves supported modification time, honors exclusive creation and overwrites existing destinations");
     Ok(())
@@ -692,6 +738,7 @@ fn exercise(target: &Path, source: &Path) -> Result<()> {
     rename_open_directory(target, source)?;
     file_attributes(target, source)?;
     file_times(target, source)?;
+    creation_attributes(target, source)?;
     native_copy(target, source)?;
     Ok(())
 }

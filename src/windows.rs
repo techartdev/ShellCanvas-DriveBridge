@@ -238,7 +238,7 @@ impl FileSystemContext for Fs {
         name: &U16CStr,
         options: u32,
         access: u32,
-        _: u32,
+        requested_attributes: u32,
         _: Option<&[c_void]>,
         _: u64,
         _: Option<&[u8]>,
@@ -254,11 +254,29 @@ impl FileSystemContext for Fs {
             .map_err(|_| FspError::from(STATUS_DEVICE_NOT_CONNECTED))?;
         let path = path(name)?;
         let is_dir = options & 1 != 0;
+        let requested_attributes = crate::windows_attributes::creation_attributes(requested_attributes, is_dir)
+            .map_err(failure)?;
         if is_dir {
             self.call(Operation::Mkdir { path: path.clone() })?;
         }
         let context = self.open_context(path, access, FsCreate::CreateNew, is_dir, open)?;
-        fill(info.as_mut(), &self.metadata(&context)?);
+        let initialized = (|| {
+            let meta = self.metadata(&context)?;
+            if let Some(permissions) = crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)? {
+                self.call(Operation::SetFileMetadata {
+                    handle: context.file.ok_or_else(invalid)?,
+                    metadata: FsSetMetadata { permissions: Some(permissions), ..Default::default() },
+                })?;
+            }
+            fill(info.as_mut(), &self.metadata(&context)?);
+            Ok(())
+        })();
+        if let Err(error) = initialized {
+            // A failed remote metadata call may have taken effect. Do not
+            // delete by path: another remote actor could have replaced it.
+            self.warn("A new remote entry was created but its initial metadata could not be confirmed. Inspect the destination before retrying.".into());
+            return Err(error);
+        }
         Ok(context)
     }
     fn close(&self, context: Context) {
@@ -357,13 +375,29 @@ impl FileSystemContext for Fs {
     fn overwrite(
         &self,
         context: &Context,
-        _: u32,
-        _: bool,
+        requested_attributes: u32,
+        replace_attributes: bool,
         _: u64,
         _: Option<&[u8]>,
         info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        self.set_file_size(context, 0, false, info)
+        if !self.caps.writable {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
+        }
+        let meta = self.metadata(context)?;
+        let mut requested_attributes = crate::windows_attributes::creation_attributes(requested_attributes, false)
+            .map_err(failure)?;
+        if !replace_attributes {
+            requested_attributes |= attributes(&meta);
+        }
+        // Validate the complete request before truncating an existing file.
+        let permissions = crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)?;
+        self.call(Operation::SetFileMetadata {
+            handle: context.file.ok_or_else(invalid)?,
+            metadata: FsSetMetadata { size: Some(0), permissions, ..Default::default() },
+        })?;
+        fill(info, &self.metadata(context)?);
+        Ok(())
     }
     fn set_basic_info(
         &self,
