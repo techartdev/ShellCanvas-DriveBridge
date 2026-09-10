@@ -686,13 +686,86 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
         gid: unsafe { libc::getgid() },
     };
     let session = fuser::spawn_mount(fs, target, &config)?;
+    pipe.call(Operation::Report {
+        event: BridgeEvent::Ready,
+    })?;
     eprintln!("SHELLCANVAS_BRIDGE_READY");
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        if pipe.call(Operation::Capabilities).is_err() {
-            break;
+        if session.guard.is_finished() {
+            session.join()?;
+            pipe.call(Operation::Report {
+                event: BridgeEvent::Detached,
+            })?;
+            return Ok(());
+        }
+        match pipe.call(Operation::Poll) {
+            Ok(Value::Directive(BridgeDirective::Continue)) => {}
+            Ok(Value::Directive(BridgeDirective::Detach)) => match ordinary_unmount(target) {
+                Ok(()) => {
+                    session.join()?;
+                    pipe.call(Operation::Report {
+                        event: BridgeEvent::Detached,
+                    })?;
+                    return Ok(());
+                }
+                Err(message) => {
+                    pipe.call(Operation::Report {
+                        event: BridgeEvent::DetachFailed { message },
+                    })?;
+                }
+            },
+            _ => break,
         }
     }
     drop(session);
     Ok(())
+}
+
+/// Preserve a busy mount. Never pass force or lazy-detach flags.
+fn ordinary_unmount(target: &std::path::Path) -> std::result::Result<(), String> {
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let helper = [
+            "/usr/bin/fusermount3",
+            "/bin/fusermount3",
+            "/usr/bin/fusermount",
+            "/bin/fusermount",
+        ]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .ok_or("Install your distribution's FUSE mount helper before detaching")?;
+        let mut command = Command::new(helper);
+        command.args(["-u", "--"]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("/sbin/umount");
+    let mut child = command
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Cannot start the system unmount helper: {e}"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => {
+                return Err(format!(
+                    "The system did not confirm detach ({status}). Close local files and folders using it, then try again."
+                ));
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err("Unmount helper timed out. Check local file use and the mount's status before retrying.".into());
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }

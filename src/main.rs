@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 use shellcanvas_filesystem_sdk::{
+    bridge_control::{BridgeDirective, BridgeEvent},
     wire::{Client, Operation, Value},
     *,
 };
@@ -9,6 +10,8 @@ use std::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fuse;
+#[cfg(any(windows, test))]
+mod mount_gate;
 mod probe;
 #[cfg(windows)]
 mod windows;

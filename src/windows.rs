@@ -81,12 +81,14 @@ struct Directory {
     eof: bool,
 }
 pub struct Context {
+    _open: crate::mount_gate::OpenGuard,
     path: Mutex<MountPath>,
     file: Option<u64>,
     directory: Mutex<Directory>,
     is_dir: bool,
 }
 struct Fs {
+    gate: Arc<crate::mount_gate::MountGate>,
     pipe: Arc<Pipe>,
     caps: FsCapabilities,
 }
@@ -119,6 +121,7 @@ impl Fs {
         access: u32,
         create: FsCreate,
         is_dir: bool,
+        open: crate::mount_gate::OpenGuard,
     ) -> winfsp::Result<Context> {
         let file = if is_dir {
             None
@@ -141,6 +144,7 @@ impl Fs {
             }
         };
         Ok(Context {
+            _open: open,
             path: Mutex::new(path),
             file,
             directory: Mutex::new(Directory {
@@ -175,6 +179,10 @@ impl FileSystemContext for Fs {
         access: u32,
         info: &mut OpenFileInfo,
     ) -> winfsp::Result<Context> {
+        let open = self
+            .gate
+            .enter()
+            .map_err(|_| FspError::from(STATUS_DEVICE_NOT_CONNECTED))?;
         let path = path(name)?;
         let m = self.path_metadata(path.clone())?;
         let is_dir = m.kind == FsKind::Directory;
@@ -184,7 +192,7 @@ impl FileSystemContext for Fs {
         if options & 0x40 != 0 && is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY.into());
         }
-        let context = self.open_context(path, access, FsCreate::OpenExisting, is_dir)?;
+        let context = self.open_context(path, access, FsCreate::OpenExisting, is_dir, open)?;
         fill(info.as_mut(), &m);
         Ok(context)
     }
@@ -203,12 +211,16 @@ impl FileSystemContext for Fs {
         if !self.caps.writable {
             return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
         }
+        let open = self
+            .gate
+            .enter()
+            .map_err(|_| FspError::from(STATUS_DEVICE_NOT_CONNECTED))?;
         let path = path(name)?;
         let is_dir = options & 1 != 0;
         if is_dir {
             self.call(Operation::Mkdir { path: path.clone() })?;
         }
-        let context = self.open_context(path, access, FsCreate::CreateNew, is_dir)?;
+        let context = self.open_context(path, access, FsCreate::CreateNew, is_dir, open)?;
         fill(info.as_mut(), &self.metadata(&context)?);
         Ok(context)
     }
@@ -522,20 +534,41 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
         .file_info_timeout(0)
         .flush_and_purge_on_cleanup(true)
         .irp_timeout(60000);
+    let gate = Arc::new(crate::mount_gate::MountGate::default());
     let mut host = FileSystemHost::<_, winfsp::host::CoarseGuard>::new(
         params,
         Fs {
+            gate: gate.clone(),
             pipe: pipe.clone(),
             caps,
         },
     )?;
     host.mount(target)?;
     host.start()?;
+    pipe.call(Operation::Report {
+        event: BridgeEvent::Ready,
+    })?;
     eprintln!("SHELLCANVAS_BRIDGE_READY");
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        if pipe.call(Operation::Capabilities).is_err() {
-            break;
+        match pipe.call(Operation::Poll) {
+            Ok(Value::Directive(BridgeDirective::Continue)) => {}
+            Ok(Value::Directive(BridgeDirective::Detach)) => match gate.begin_detach() {
+                Ok(()) => {
+                    host.unmount();
+                    host.stop();
+                    pipe.call(Operation::Report {
+                        event: BridgeEvent::Detached,
+                    })?;
+                    return Ok(());
+                }
+                Err(message) => {
+                    pipe.call(Operation::Report {
+                        event: BridgeEvent::DetachFailed { message },
+                    })?;
+                }
+            },
+            _ => break,
         }
     }
     host.unmount();
