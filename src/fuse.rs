@@ -708,7 +708,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
         event: BridgeEvent::Ready,
     })?;
     eprintln!("SHELLCANVAS_BRIDGE_READY");
-    loop {
+    let failure = loop {
         std::thread::sleep(Duration::from_secs(1));
         if session.guard.is_finished() {
             session.join()?;
@@ -733,11 +733,12 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
                     })?;
                 }
             },
-            _ => break,
+            Err(error) => break format!("Filesystem connection lost: {error}"),
+            Ok(_) => break "Invalid filesystem lifecycle reply".to_owned(),
         }
-    }
+    };
     drop(session);
-    Ok(())
+    anyhow::bail!(failure)
 }
 
 /// Preserve a busy mount. Never pass force or lazy-detach flags.

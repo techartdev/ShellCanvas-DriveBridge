@@ -479,6 +479,11 @@ async fn native_windows_mount() -> Result<()> {
         std::env::var("SHELLCANVAS_NATIVE_WINDOWS_TEST").as_deref() == Ok("1"),
         "Explicit native-test opt-in required"
     );
+    native_scenario(false).await?;
+    native_scenario(true).await
+}
+
+async fn native_scenario(lose_transport: bool) -> Result<()> {
     let drives = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
     ensure!(drives != 0, "Cannot enumerate local drives");
     let letter = (b'D'..=b'Z')
@@ -509,6 +514,33 @@ async fn native_windows_mount() -> Result<()> {
     );
     let result: Result<()> = async {
         phase(&control, BridgePhase::Attached).await?;
+        if lose_transport {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows::Win32::Storage::FileSystem::FILE_FLAG_WRITE_THROUGH;
+            let mut held = fs::OpenOptions::new().write(true).create_new(true)
+                .custom_flags(FILE_FLAG_WRITE_THROUGH.0).open(target.join("connection-loss.bin"))?;
+            held.write_all(b"confirmed")?;
+            held.sync_all()?;
+            // Abruptly drop both parent pipe endpoints. This is actual IPC loss,
+            // distinct from the previous per-operation Offline error injection.
+            serving.abort();
+            while !serving.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let lost_write = tokio::task::spawn_blocking(move || {
+                held.write_all(b"unconfirmed").expect_err("Write succeeded after losing the provider");
+                drop(held);
+            });
+            tokio::time::timeout(Duration::from_secs(10), lost_write).await
+                .context("Local write hung after provider connection loss")??;
+            let status = tokio::time::timeout(Duration::from_secs(10), child.wait()).await
+                .context("Bridge did not exit after connection loss")??;
+            ensure!(!status.success(), "Unexpected connection loss was reported as a successful exit");
+            ensure!(unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() } & (1 << (letter - b'A')) == 0, "Drive remained after connection loss");
+            ensure!(fs::read(backing.path().join("connection-loss.bin"))? == b"confirmed", "Unconfirmed write changed source after connection loss");
+            println!("NATIVE_WINDOWS_TRANSPORT_LOSS_PASS: open-file write fails within deadline, source preserved, bridge exits with failure and drive removed");
+            return Ok(());
+        }
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || exercise(&p, &source)).await??;
         let p = target.clone(); let source = backing.path().to_owned();

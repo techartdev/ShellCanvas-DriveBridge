@@ -604,7 +604,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
         event: BridgeEvent::Ready,
     })?;
     eprintln!("SHELLCANVAS_BRIDGE_READY");
-    loop {
+    let failure = loop {
         std::thread::sleep(Duration::from_secs(1));
         match pipe.call(Operation::Poll) {
             Ok(Value::Directive(BridgeDirective::Continue)) => {}
@@ -623,10 +623,11 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
                     })?;
                 }
             },
-            _ => break,
+            Err(error) => break format!("Filesystem connection lost: {error}"),
+            Ok(_) => break "Invalid filesystem lifecycle reply".to_owned(),
         }
-    }
+    };
     host.unmount();
     host.stop();
-    Ok(())
+    anyhow::bail!(failure)
 }
