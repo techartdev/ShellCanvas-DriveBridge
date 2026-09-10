@@ -142,6 +142,20 @@ Failed close and cleanup-time deletion reach the parent as warnings, and failed
 deletion preserves the source file. These are injected provider errors, not a
 real network outage or exhausted remote disk.
 
+[CI run 34513391440](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34513391440)
+at `1459801` additionally cuts both inherited pipe endpoints with a Windows file
+still open. The next write fails within a ten-second deadline, confirmed backing
+bytes remain intact, the bridge exits unsuccessfully and the drive letter is
+removed. Unexpected lifecycle replies or lost connections now produce a failure
+exit on Windows and FUSE. Normal explicit detach still exits successfully.
+This exercises real bridge transport loss; SSH network interruption is separate.
+
+Normal FUSE detach uses the ordinary system unmount helper and preserves a busy
+mount. Abnormal process/session teardown also involves `fuser`'s own cleanup;
+its fallback can use lazy/forced unmount depending on the platform. That path
+still needs native failure acceptance. ShellCanvas retains failed mappings for
+inspection and verifies the OS mount table before releasing cleanup ownership.
+
 ## Licensing and commercial distribution
 
 Drive Bridge is **GPL-3.0-only**, reflecting its use of the GPL-licensed
