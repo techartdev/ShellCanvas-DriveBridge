@@ -5,10 +5,11 @@ provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
 **Development preview — not an end-user release yet.** Windows, Linux and macOS
-builds pass in CI. A native Linux mount has passed live SFTP file-operation
-checks, and the Windows executable has passed the separate-process SFTP protocol
-test. Windows/macOS native mount acceptance, the ShellCanvas attachment UI,
-installation and graceful busy-detach integration are still in progress.
+builds pass in CI. Native Linux mounts pass live SFTP file-operation checks.
+Native Windows mounts pass file-operation, memory-mapping and busy-detach tests
+with WinFsp and a disposable local provider. The Windows executable also passes
+the separate-process SFTP protocol test. A desktop-created Windows SFTP mapping,
+the installation UI and macOS native runtime acceptance remain unverified.
 Do not treat compilation as verified filesystem compatibility.
 
 ## Architecture
@@ -30,7 +31,7 @@ protocol. Simple ShellCanvas adapters need not implement mounting.
 
 | Client | Native integration | Current verification |
 | --- | --- | --- |
-| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Executable builds; native mount test pending |
+| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Native WinFsp 2.1.25156: offset I/O above 4 GiB, truncate, replacement save, paged enumeration, capacity, shared/private/read-only mappings and busy detach pass with a disposable local provider |
 | Linux | FUSE kernel interface and the distribution's mount helper | Native x86_64 mount: real SFTP offset I/O, truncate, replacement saves, directory paging, rename with an open file and capacity checks pass |
 | macOS | Separately installed [macFUSE](https://macfuse.github.io/) | macOS 14 CI build passes; native mount verification pending |
 
@@ -103,10 +104,34 @@ it creates and removes test files and must not receive a user's working folder.
   reach the provider when pages are flushed, not on each CPU write. Coherence
   with concurrent remote edits and database/VM workloads is not promised.
   Kernels without that capability keep their existing direct-I/O limitations.
-  macOS and Windows mapped-file acceptance remain pending. See the
+  Windows WinFsp acceptance also passes shared cross-page flush, mapping lifetime
+  after descriptor close, read-only and private copy-on-write maps against a
+  disposable local provider. macOS mapped-file acceptance remains pending. See the
   [Linux FUSE I/O contract](https://www.kernel.org/doc/html/latest/filesystems/fuse/fuse-io.html).
-- Driver setup, live filesystem acceptance and graceful busy detach remain release
-  gates. This preview should not be used for valuable working files yet.
+- Full desktop setup, failure recovery and modern macOS runtime acceptance remain
+  release gates. This preview should not be used for valuable working files yet.
+
+## Native Windows verification
+
+The opt-in `tests/native_windows.rs` test launches the actual bridge, mounts an
+unused drive letter, exercises ordinary Windows file APIs and inspects the backing
+files independently. It verifies exact directory contents across multiple pages,
+missing/denied/nonempty errors, capacity and memory mapping. An open file must
+prevent detach; a second explicit request after closing it must remove the drive.
+It uses a temporary local provider, no SSH credentials or normal app profile.
+
+[CI run 34511425152](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34511425152)
+passed this test at `30c4125` (27.93 seconds). CI installs the official WinFsp MSI
+only on its disposable Windows runner after checking the pinned SHA-256 and
+Authenticode signer. Ordinary `cargo test` skips this driver-dependent test.
+To run explicitly on a Windows test machine with WinFsp already installed:
+
+```powershell
+$env:SHELLCANVAS_NATIVE_WINDOWS_TEST = '1'
+cargo test --locked --test native_windows -- --ignored --nocapture
+```
+
+This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
 
 ## Licensing and commercial distribution
 
