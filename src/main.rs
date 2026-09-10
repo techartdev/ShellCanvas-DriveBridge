@@ -19,6 +19,8 @@ mod windows;
 mod windows_handles;
 #[cfg(any(windows, test))]
 mod windows_attributes;
+#[cfg(any(windows, test))]
+mod windows_times;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();

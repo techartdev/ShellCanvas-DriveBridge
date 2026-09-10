@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 use super::*;
 use crate::windows_attributes::attributes;
+use crate::windows_times::{filetime, unix_seconds, validate_unsupported_times};
 use ::windows::Win32::Foundation::*;
 use std::{
     collections::VecDeque,
@@ -49,24 +50,15 @@ fn path(name: &U16CStr) -> winfsp::Result<MountPath> {
             path.child(name).map_err(failure)
         })
 }
-fn timestamp(seconds: Option<u64>) -> u64 {
-    seconds
-        .unwrap_or(0)
-        .saturating_add(11_644_473_600)
-        .saturating_mul(10_000_000)
-}
-fn unix_timestamp(time: u64) -> Option<u64> {
-    (time != 0 && time != u64::MAX).then(|| (time / 10_000_000).saturating_sub(11_644_473_600))
-}
 fn fill(info: &mut FileInfo, meta: &FsMetadata) {
     *info = FileInfo::default();
     info.file_attributes = attributes(meta);
     info.file_size = meta.size;
     info.allocation_size = meta.size.div_ceil(4096).saturating_mul(4096);
-    info.creation_time = timestamp(meta.modified);
-    info.last_write_time = timestamp(meta.modified);
-    info.change_time = timestamp(meta.modified);
-    info.last_access_time = timestamp(meta.accessed);
+    // The portable metadata contract exposes neither birth time nor change time.
+    // Leave these unavailable instead of presenting modification time as both.
+    info.last_write_time = filetime(meta.modified);
+    info.last_access_time = filetime(meta.accessed);
 }
 struct Directory {
     handle: Option<u64>,
@@ -376,15 +368,16 @@ impl FileSystemContext for Fs {
         &self,
         context: &Context,
         requested_attributes: u32,
-        _: u64,
+        created: u64,
         access: u64,
         write: u64,
-        _: u64,
+        changed: u64,
         info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        validate_unsupported_times(created, changed).map_err(failure)?;
         let metadata = FsSetMetadata {
-            accessed: unix_timestamp(access),
-            modified: unix_timestamp(write),
+            accessed: unix_seconds(access).map_err(failure)?,
+            modified: unix_seconds(write).map_err(failure)?,
             permissions: crate::windows_attributes::permissions(&self.metadata(context)?, requested_attributes)
                 .map_err(failure)?,
             ..Default::default()
