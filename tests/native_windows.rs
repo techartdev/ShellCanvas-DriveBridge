@@ -69,7 +69,12 @@ fn set(file: &fs::File, m: FsSetMetadata) -> std::io::Result<()> {
     }
     Ok(())
 }
-struct LocalFile(Mutex<Option<fs::File>>, String);
+#[derive(Default)]
+struct FlushAudit {
+    seen: Mutex<Vec<String>>,
+    fail_volume: std::sync::atomic::AtomicBool,
+}
+struct LocalFile(Mutex<Option<fs::File>>, String, Arc<FlushAudit>);
 impl LocalFile {
     fn with<T>(&self, op: impl FnOnce(&mut fs::File) -> std::io::Result<T>) -> FsResult<T> {
         let mut guard = self.0.lock().unwrap();
@@ -113,7 +118,9 @@ impl MountedFile for LocalFile {
         self.with(|f| set(f, m))
     }
     async fn flush(&self) -> FsResult<()> {
-        if self.1 == "flush-failed.bin" {
+        self.2.seen.lock().unwrap().push(self.1.clone());
+        if self.1 == "flush-failed.bin"
+            || (self.1 == "volume-failed.bin" && self.2.fail_volume.load(std::sync::atomic::Ordering::SeqCst)) {
             return Err(FsError::new(FsErrorKind::Io, "Injected flush failure"));
         }
         self.with(|f| f.sync_all())
@@ -148,7 +155,7 @@ impl MountedDirectory for LocalDirectory {
         Ok(())
     }
 }
-struct LocalRoot(PathBuf);
+struct LocalRoot(PathBuf, Arc<FlushAudit>);
 impl LocalRoot {
     fn path(&self, path: &MountPath) -> PathBuf {
         path.components()
@@ -207,6 +214,7 @@ impl MountedFileSystem for LocalRoot {
         Ok(Arc::new(LocalFile(
             Mutex::new(Some(file.open(self.path(path)).map_err(error)?)),
             path.components().last().cloned().unwrap_or_default(),
+            self.1.clone(),
         )))
     }
     async fn open_directory(&self, path: &MountPath) -> FsResult<Box<dyn MountedDirectory>> {
@@ -442,6 +450,42 @@ fn rename_open_directory(target: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn volume_flush(mount: &str, target: &Path, source: &Path, audit: &FlushAudit) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Foundation::ERROR_IO_DEVICE;
+    // The drive letter was selected from GetLogicalDrives before mounting this
+    // disposable bridge. Never open any physical disk or another volume here.
+    let volume = fs::OpenOptions::new().read(true).write(true)
+        .open(format!(r"\\.\{mount}")).context("Open disposable bridge volume for flushing")?;
+    let names = ["volume-first.bin", "volume-failed.bin", "volume-last.bin"];
+    let mut files = Vec::new();
+    for name in names {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(target.join(name))?;
+        file.write_all(name.as_bytes())?;
+        files.push(file);
+    }
+    audit.fail_volume.store(true, Ordering::SeqCst);
+    audit.seen.lock().unwrap().clear();
+    let failure = volume.sync_all().expect_err("Volume flush acknowledged a failed file flush");
+    ensure!(failure.raw_os_error() == Some(ERROR_IO_DEVICE.0 as i32), "Wrong volume flush error: {failure}");
+    let seen = audit.seen.lock().unwrap().clone();
+    for name in names {
+        ensure!(seen.iter().any(|item| item == name), "Volume flush skipped {name}: {seen:?}");
+    }
+    audit.fail_volume.store(false, Ordering::SeqCst);
+    audit.seen.lock().unwrap().clear();
+    volume.sync_all().context("Volume flush did not recover after provider failure cleared")?;
+    let seen = audit.seen.lock().unwrap().clone();
+    for name in names {
+        ensure!(seen.iter().any(|item| item == name), "Successful volume flush skipped {name}: {seen:?}");
+        ensure!(fs::read(source.join(name))? == name.as_bytes(), "Volume flush did not persist {name}");
+    }
+    drop(files);
+    drop(volume);
+    println!("NATIVE_WINDOWS_VOLUME_FLUSH_PASS: native volume flush visits every writer, reports a provider failure and succeeds with independently verified bytes after recovery");
+    Ok(())
+}
+
 fn exercise(target: &Path, source: &Path) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -555,6 +599,7 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         fs::write(backing.path().join(name), b"original")?;
     }
     let control = Arc::new(BridgeControl::default());
+    let flush_audit = Arc::new(FlushAudit::default());
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shellcanvas-drive-bridge"))
         .args(["--mount", &mount])
         .stdin(Stdio::piped())
@@ -564,7 +609,7 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         .spawn()?;
     let serving = tokio::spawn(
         Server::with_control(
-            Arc::new(LocalRoot(backing.path().to_owned())),
+            Arc::new(LocalRoot(backing.path().to_owned(), flush_audit.clone())),
             control.clone(),
         )
         .serve(child.stdout.take().unwrap(), child.stdin.take().unwrap()),
@@ -600,6 +645,9 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         }
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || exercise(&p, &source)).await??;
+        let p = target.clone(); let source = backing.path().to_owned();
+        let volume_name = mount.clone(); let audit = flush_audit.clone();
+        tokio::task::spawn_blocking(move || volume_flush(&volume_name, &p, &source, &audit)).await??;
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || failed_writes(&p, &source)).await??;
         drop(fs::File::open(target.join("close-failed.bin"))?);
