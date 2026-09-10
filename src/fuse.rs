@@ -90,10 +90,139 @@ struct Node {
 struct Directory {
     ino: u64,
     path: MountPath,
-    remote: u64,
+    remote: Option<u64>,
     offset: u64,
     pending: VecDeque<FsDirectoryEntry>,
     eof: bool,
+}
+impl Directory {
+    fn prepare(
+        &mut self,
+        offset: u64,
+        mut call: impl FnMut(Operation) -> Result<Value>,
+    ) -> Result<()> {
+        if self.remote.is_some() && offset >= self.offset {
+            return Ok(());
+        }
+        // Closing retires the server handle even if its close operation fails.
+        // Clear ownership before sending it; a subsequent seek/read must reopen
+        // rather than use the retired handle or buffered entries from that stream.
+        self.offset = 0;
+        self.pending.clear();
+        self.eof = false;
+        if let Some(handle) = self.remote.take() {
+            call(Operation::CloseDirectory { handle })?;
+        }
+        self.remote = Some(
+            match call(Operation::OpenDirectory {
+                path: self.path.clone(),
+            })? {
+                Value::Handle(handle) => handle,
+                _ => return Err(Errno::EIO),
+            },
+        );
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    fn cursor() -> Directory {
+        Directory {
+            ino: 2,
+            path: MountPath::root().child("directory").unwrap(),
+            remote: Some(11),
+            offset: 12,
+            pending: VecDeque::from([FsDirectoryEntry {
+                name: "stale-buffered-entry".into(),
+                metadata: FsMetadata {
+                    kind: FsKind::File,
+                    size: 0,
+                    accessed: None,
+                    modified: None,
+                    permissions: None,
+                },
+            }]),
+            eof: true,
+        }
+    }
+    #[test]
+    fn failed_rewind_reopens_even_when_next_seek_uses_a_later_cookie() {
+        // Failed close, failed reopen, and malformed reopen reply must all leave
+        // the cursor retryable. A later seek need not repeat the rewind's offset.
+        for failure in 0..3 {
+            let mut dir = cursor();
+            let mut calls = Vec::new();
+            let result = dir.prepare(0, |op| match op {
+                Operation::CloseDirectory { handle } => {
+                    assert_eq!(handle, 11);
+                    calls.push("close");
+                    if failure == 0 {
+                        Err(Errno::EIO)
+                    } else {
+                        Ok(Value::Unit)
+                    }
+                }
+                Operation::OpenDirectory { .. } => {
+                    calls.push("open");
+                    if failure == 1 {
+                        Err(Errno::EACCES)
+                    } else {
+                        Ok(Value::Unit)
+                    }
+                }
+                _ => panic!("Unexpected operation"),
+            });
+            assert!(result.is_err());
+            assert!(dir.remote.is_none());
+            assert!(dir.pending.is_empty());
+            assert_eq!(
+                calls,
+                if failure == 0 {
+                    vec!["close"]
+                } else {
+                    vec!["close", "open"]
+                }
+            );
+            // Rename may have happened since the failure. Use the current path.
+            dir.path = MountPath::root().child("renamed").unwrap();
+            dir.prepare(40, |op| match op {
+                Operation::OpenDirectory { path } => {
+                    assert_eq!(path.components(), &["renamed"]);
+                    Ok(Value::Handle(42))
+                }
+                _ => panic!("Retried a retired handle"),
+            })
+            .unwrap();
+            assert_eq!(dir.remote, Some(42));
+            assert_eq!(dir.offset, 0);
+            assert!(!dir.eof);
+        }
+    }
+    #[test]
+    fn forward_read_retains_stream_and_rewind_starts_fresh() {
+        let mut dir = cursor();
+        dir.prepare(12, |_| panic!("Sequential read reopened the stream"))
+            .unwrap();
+        assert_eq!(dir.pending.len(), 1);
+        let mut closed = false;
+        dir.prepare(0, |op| match op {
+            Operation::CloseDirectory { handle: 11 } => {
+                closed = true;
+                Ok(Value::Unit)
+            }
+            Operation::OpenDirectory { .. } => {
+                assert!(closed);
+                Ok(Value::Handle(22))
+            }
+            _ => panic!("Unexpected operation"),
+        })
+        .unwrap();
+        assert_eq!(dir.remote, Some(22));
+        assert_eq!(dir.offset, 0);
+        assert!(dir.pending.is_empty());
+        assert!(!dir.eof);
+    }
 }
 struct State {
     next: u64,
@@ -579,7 +708,7 @@ impl Filesystem for Fs {
                 Directory {
                     ino: ino.0,
                     path,
-                    remote,
+                    remote: Some(remote),
                     offset: 0,
                     pending: VecDeque::new(),
                     eof: false,
@@ -603,21 +732,12 @@ impl Filesystem for Fs {
         let result = (|| {
             let mut state = self.state()?;
             let dir = state.dirs.get_mut(&fh.0).ok_or(Errno::EBADF)?;
-            if offset < dir.offset {
-                self.call(Operation::CloseDirectory { handle: dir.remote })?;
-                dir.remote = match self.call(Operation::OpenDirectory {
-                    path: dir.path.clone(),
-                })? {
-                    Value::Handle(h) => h,
-                    _ => return Err(Errno::EIO),
-                };
-                dir.offset = 0;
-                dir.pending.clear();
-                dir.eof = false;
-            }
+            dir.prepare(offset, |op| self.call(op))?;
             loop {
                 if dir.pending.is_empty() && !dir.eof {
-                    match self.call(Operation::ReadDirectory { handle: dir.remote })? {
+                    match self.call(Operation::ReadDirectory {
+                        handle: dir.remote.ok_or(Errno::EBADF)?,
+                    })? {
                         Value::Entries(entries) => {
                             dir.eof = entries.is_empty();
                             dir.pending.extend(entries);
@@ -648,7 +768,9 @@ impl Filesystem for Fs {
     fn releasedir(&self, _: &Request, _: INodeNo, fh: FileHandle, _: OpenFlags, reply: ReplyEmpty) {
         let result = (|| {
             let dir = self.state()?.dirs.remove(&fh.0).ok_or(Errno::EBADF)?;
-            let result = self.call(Operation::CloseDirectory { handle: dir.remote });
+            let result = dir.remote.map_or(Ok(Value::Unit), |handle| {
+                self.call(Operation::CloseDirectory { handle })
+            });
             let mut state = self.state()?;
             if let Some(n) = state.nodes.get_mut(&dir.ino) {
                 n.opens = n.opens.saturating_sub(1);
