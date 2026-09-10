@@ -571,6 +571,35 @@ fn file_times(target: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
+fn native_copy(target: &Path, source: &Path) -> Result<()> {
+    use windows::{core::HSTRING, Win32::Storage::FileSystem::CopyFileW};
+    let local = tempfile::tempdir()?;
+    let input = local.path().join("local-input.txt");
+    let output = local.path().join("local-output.txt");
+    let mounted = target.join("copied.txt");
+    let contents: Vec<u8> = (0..65_539).map(|i| (i % 251) as u8).collect();
+    fs::write(&input, &contents)?;
+    fs::OpenOptions::new().write(true).open(&input)?.set_times(
+        fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_123)))?;
+    unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), true) }
+        .context("Native CopyFileW from local filesystem into mounted directory")?;
+    ensure!(fs::read(source.join("copied.txt"))? == contents, "Local-to-mounted copy changed bytes");
+    ensure!(fs::metadata(source.join("copied.txt"))?.modified()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_123,
+        "Local-to-mounted copy lost supported modification time");
+    unsafe { CopyFileW(&HSTRING::from(mounted.as_os_str()), &HSTRING::from(output.as_os_str()), true) }
+        .context("Native CopyFileW from mounted directory to local filesystem")?;
+    ensure!(fs::read(&output)? == contents, "Mounted-to-local copy changed bytes");
+    ensure!(unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), true) }.is_err(),
+        "Exclusive native copy overwrote an existing destination");
+    fs::write(&input, b"overwrite via native copy")?;
+    unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), false) }
+        .context("Native CopyFileW replacing an existing mounted file")?;
+    ensure!(fs::read(source.join("copied.txt"))? == b"overwrite via native copy", "Native copy overwrite lost data");
+    fs::remove_file(&mounted)?;
+    println!("NATIVE_WINDOWS_COPY_PASS: CopyFileW transfers both directions, preserves supported modification time, honors exclusive creation and overwrites existing destinations");
+    Ok(())
+}
+
 fn exercise(target: &Path, source: &Path) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -657,6 +686,7 @@ fn exercise(target: &Path, source: &Path) -> Result<()> {
     rename_open_directory(target, source)?;
     file_attributes(target, source)?;
     file_times(target, source)?;
+    native_copy(target, source)?;
     Ok(())
 }
 
