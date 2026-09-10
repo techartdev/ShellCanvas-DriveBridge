@@ -152,8 +152,13 @@ This exercises real bridge transport loss; SSH network interruption is separate.
 
 Normal FUSE detach uses the ordinary system unmount helper and preserves a busy
 mount. Abnormal process/session teardown also involves `fuser`'s own cleanup;
-its fallback can use lazy/forced unmount depending on the platform. That path
-still needs native failure acceptance. ShellCanvas retains failed mappings for
+its fallback can use lazy/forced unmount depending on the platform. Linux 6.8
+acceptance as root at `1459801` cuts the actual pipes with a local file open over
+the core SFTP provider: write and close return ENOTCONN, confirmed source bytes
+remain unchanged, the helper exits unsuccessfully and the native mount table
+shows removal. The fixture and staged binary were then verified removed.
+Non-root helper fallback and modern macOS failure cleanup remain unverified.
+ShellCanvas retains failed mappings for
 inspection and verifies the OS mount table before releasing cleanup ownership.
 
 ## Licensing and commercial distribution
