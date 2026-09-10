@@ -242,6 +242,24 @@ macro_rules! empty_reply {
     };
 }
 impl Filesystem for Fs {
+    fn init(&mut self, _: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Keep ordinary reads/writes direct. Modern Linux can separately permit
+        // shared mappings, whose dirty pages reach us on msync/fsync/unmap.
+        // Do not enable generic writeback caching for a remotely mutable tree.
+        #[cfg(target_os = "linux")]
+        if config
+            .capabilities()
+            .contains(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP)
+        {
+            config
+                .add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP)
+                .map_err(|_| std::io::Error::other("Kernel rejected shared mapping capability"))?;
+            eprintln!("SHELLCANVAS_BRIDGE_SHARED_MMAP_ENABLED");
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = config;
+        Ok(())
+    }
     fn lookup(&self, _: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.child(parent, name).and_then(|p| self.lookup_path(p)) {
             Ok(a) => reply.entry(&Duration::ZERO, &a, Generation(1)),
