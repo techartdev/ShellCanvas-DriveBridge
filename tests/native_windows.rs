@@ -402,14 +402,24 @@ fn rename_open_directory(target: &Path, source: &Path) -> Result<()> {
     let second = open_directory()?;
     let mut child = fs::OpenOptions::new().read(true).write(true)
         .open(original.join("child.txt"))?;
-    fs::rename(&original, &renamed).context("Rename directory with open descendants")?;
+    // Windows FileRenameInformation rejects a directory containing open files.
+    // Verified against native NTFS as well as the Microsoft MS-FSA specification.
+    // Keep the Windows rule instead of imposing POSIX descendant-rename behavior.
+    let busy = fs::rename(&original, &renamed).expect_err("Renamed a directory containing an open file");
+    ensure!(busy.raw_os_error() == Some(5), "Unexpected open-descendant rename error: {busy}");
     ensure!(first.metadata()?.is_dir() && second.metadata()?.is_dir(),
-        "Open directory aliases lost metadata after rename");
+        "Rejected rename changed open directory aliases");
     child.seek(SeekFrom::Start(0))?;
     child.write_all(b"after!")?;
     child.sync_all()?;
+    ensure!(fs::read(source.join("open-directory/child.txt"))? == b"after!",
+        "Rejected directory rename changed the open child");
+    drop(child);
+    fs::rename(&original, &renamed).context("Rename after closing descendant, with directory aliases open")?;
+    ensure!(first.metadata()?.is_dir() && second.metadata()?.is_dir(),
+        "Open directory aliases lost metadata after rename");
     ensure!(fs::read(source.join("moved-directory/child.txt"))? == b"after!",
-        "Open child lost its identity after directory rename");
+        "Directory rename changed child contents");
     ensure!(!source.join("open-directory").exists(), "Old directory path remained");
 
     let blocked = target.join("blocked-directory");
@@ -419,20 +429,16 @@ fn rename_open_directory(target: &Path, source: &Path) -> Result<()> {
         "Rename unexpectedly replaced a nonempty directory");
     ensure!(first.metadata()?.is_dir() && second.metadata()?.is_dir(),
         "Failed rename changed open directory aliases");
-    child.seek(SeekFrom::Start(0))?;
-    let mut data = Vec::new();
-    child.read_to_end(&mut data)?;
-    ensure!(data == b"after!", "Failed rename changed the open child");
+    ensure!(fs::read(renamed.join("child.txt"))? == b"after!", "Failed rename changed the child");
     ensure!(fs::read(source.join("blocked-directory/sentinel.txt"))? == b"keep",
         "Failed rename damaged the destination");
-    drop(child);
     drop(second);
     drop(first);
     fs::remove_file(renamed.join("child.txt"))?;
     fs::remove_dir(&renamed)?;
     fs::remove_file(blocked.join("sentinel.txt"))?;
     fs::remove_dir(&blocked)?;
-    println!("NATIVE_WINDOWS_OPEN_RENAME_PASS: directory aliases and child handle survive successful and failed renames; source verified independently");
+    println!("NATIVE_WINDOWS_OPEN_RENAME_PASS: open child blocks directory rename without damage; closing child permits rename with directory aliases open; failed replacement preserves both trees");
     Ok(())
 }
 
