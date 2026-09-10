@@ -288,6 +288,69 @@ impl State {
             self.collect(id);
         }
     }
+    fn forget(&mut self, id: u64, count: u64) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.lookups = node.lookups.saturating_sub(count);
+        }
+        self.collect(id);
+    }
+    fn release(&mut self, id: u64) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.opens = node.opens.saturating_sub(1);
+        }
+        self.collect(id);
+    }
+}
+#[cfg(test)]
+mod inode_tests {
+    use super::*;
+    #[test]
+    fn inode_survives_until_both_kernel_and_open_references_are_gone() {
+        for forget_first in [false, true] {
+            let mut state = State::new();
+            let path = MountPath::root().child("held").unwrap();
+            let id = state.lookup(path.clone()).unwrap().0;
+            assert_eq!(state.lookup(path.clone()).unwrap().0, id);
+            state.nodes.get_mut(&id).unwrap().opens = 2;
+            state.release(id);
+            state.forget(id, 1);
+            assert!(state.nodes.contains_key(&id));
+            if forget_first {
+                state.forget(id, 1);
+            } else {
+                state.release(id);
+            }
+            assert!(state.nodes.contains_key(&id));
+            if forget_first {
+                state.release(id);
+            } else {
+                state.forget(id, 1);
+            }
+            assert!(!state.nodes.contains_key(&id));
+            assert!(!state.paths.contains_key(&path));
+        }
+    }
+    #[test]
+    fn retired_open_inode_cannot_remove_recreated_path_when_forgotten() {
+        let mut state = State::new();
+        let path = MountPath::root().child("reused").unwrap();
+        let old = state.lookup(path.clone()).unwrap().0;
+        state.nodes.get_mut(&old).unwrap().opens = 1;
+        state.retire_path(&path);
+        let new = state.lookup(path.clone()).unwrap().0;
+        assert_ne!(old, new);
+        assert!(state.nodes[&old].path.is_none());
+        state.forget(old, 1);
+        assert!(state.nodes.contains_key(&old));
+        state.release(old);
+        assert!(!state.nodes.contains_key(&old));
+        assert_eq!(state.paths.get(&path), Some(&new));
+        assert_eq!(state.nodes[&new].path.as_ref(), Some(&path));
+        state.forget(1, u64::MAX);
+        state.release(1);
+        assert!(state.nodes.contains_key(&1));
+        assert_eq!(state.paths.get(&MountPath::root()), Some(&1));
+    }
 }
 struct Fs {
     pipe: Arc<Pipe>,
@@ -397,10 +460,7 @@ impl Filesystem for Fs {
     }
     fn forget(&self, _: &Request, ino: INodeNo, count: u64) {
         if let Ok(mut state) = self.state() {
-            if let Some(n) = state.nodes.get_mut(&ino.0) {
-                n.lookups = n.lookups.saturating_sub(count);
-            }
-            state.collect(ino.0);
+            state.forget(ino.0, count);
         }
     }
     fn getattr(&self, _: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -602,10 +662,7 @@ impl Filesystem for Fs {
         let result = self.call(Operation::Close { handle: fh.0 });
         if let Ok(mut state) = self.state() {
             state.files.remove(&fh.0);
-            if let Some(n) = state.nodes.get_mut(&ino.0) {
-                n.opens = n.opens.saturating_sub(1);
-            }
-            state.collect(ino.0);
+            state.release(ino.0);
         }
         empty_reply!(reply, result);
     }
@@ -772,10 +829,7 @@ impl Filesystem for Fs {
                 self.call(Operation::CloseDirectory { handle })
             });
             let mut state = self.state()?;
-            if let Some(n) = state.nodes.get_mut(&dir.ino) {
-                n.opens = n.opens.saturating_sub(1);
-            }
-            state.collect(dir.ino);
+            state.release(dir.ino);
             result
         })();
         empty_reply!(reply, result);
