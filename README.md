@@ -218,6 +218,32 @@ mount and staged binary removal were independently confirmed. All platform CI
 jobs and native Windows checks pass. Concurrent edits by another remote client
 remain outside this evidence.
 
+### Windows read-only attributes
+
+Existing regular files expose read-only when their Unix permission bits contain
+no write permission. Setting read-only through `SetFileAttributes` removes all
+write bits; clearing it restores owner write only, preserving read/execute bits
+and never adding group/other write. This is a permission projection, not a full
+Windows ACL or effective-access calculation. The remote account still determines
+which operations are allowed. Use a matching updated core: attribute-only opens
+use a remote read handle, and non-size metadata changes require a writable root.
+Read handles cannot truncate and read-only roots cannot change metadata.
+
+`SetBasicInfo` rejects hidden/system/archive and other unsupported DOS flags
+before changing timestamps or permissions. Directory read-only changes, absent
+permissions and transitions involving special Unix mode bits also report
+unsupported instead of silently changing unrelated permissions. Creation and
+overwrite attribute requests and creation/change-time semantics remain review
+items; this implementation does not claim full DOS-attribute persistence.
+
+The mapping and rejection regressions pass at `447b1c3`. Native WinFsp acceptance
+in [CI run 34523633220](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34523633220)
+checks read-only set/clear against backing metadata, rejected writes/deletion,
+and rejection of a combined hidden/read-only request without partial changes.
+The core's live SFTP probe separately verifies metadata changes through a read
+handle, rejected truncation and read-only-root enforcement. These are separate
+provider and bridge checks; desktop-created Windows SFTP acceptance remains open.
+
 ## Licensing and commercial distribution
 
 Drive Bridge is **GPL-3.0-only**, reflecting its use of the GPL-licensed
