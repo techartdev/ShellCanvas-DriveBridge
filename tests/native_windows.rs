@@ -245,6 +245,88 @@ async fn phase(control: &BridgeControl, expected: BridgePhase) -> Result<()> {
     .await
     .context("Bridge lifecycle deadline")?
 }
+struct MappedView {
+    mapping: windows::Win32::Foundation::HANDLE,
+    view: windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS,
+}
+impl MappedView {
+    fn new(
+        file: &fs::File,
+        protect: windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS,
+        access: windows::Win32::System::Memory::FILE_MAP,
+    ) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            System::Memory::*,
+        };
+        let mapping =
+            unsafe { CreateFileMappingW(HANDLE(file.as_raw_handle()), None, protect, 0, 0, None)? };
+        let view = unsafe { MapViewOfFile(mapping, access, 0, 0, 8192) };
+        if view.Value.is_null() {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(mapping)?;
+            }
+            return Err(error.into());
+        }
+        Ok(Self { mapping, view })
+    }
+}
+impl Drop for MappedView {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Memory::UnmapViewOfFile(self.view);
+            let _ = windows::Win32::Foundation::CloseHandle(self.mapping);
+        }
+    }
+}
+fn mapped_files(target: &Path, source: &Path) -> Result<()> {
+    use windows::Win32::System::Memory::*;
+    let path = target.join("mapped.bin");
+    fs::write(&path, vec![0u8; 8192])?;
+    let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
+    let shared = MappedView::new(&file, PAGE_READWRITE, FILE_MAP_WRITE)?;
+    drop(file); // Mapping must keep its file object alive without this descriptor.
+    unsafe {
+        let bytes = std::slice::from_raw_parts_mut(shared.view.Value.cast::<u8>(), 8192);
+        bytes[4093..4103].copy_from_slice(b"cross-page");
+        FlushViewOfFile(shared.view.Value, 8192)?;
+    }
+    drop(shared);
+    // FlushViewOfFile flushes dirty pages; FlushFileBuffers requests durable file flush.
+    fs::OpenOptions::new().write(true).open(&path)?.sync_all()?;
+    let expected = fs::read(source.join("mapped.bin"))?;
+    ensure!(
+        &expected[4093..4103] == b"cross-page",
+        "Mapped write did not reach provider"
+    );
+    let file = fs::File::open(&path)?;
+    let readonly = MappedView::new(&file, PAGE_READONLY, FILE_MAP_READ)?;
+    unsafe {
+        ensure!(
+            std::slice::from_raw_parts(readonly.view.Value.cast::<u8>(), 8192)
+                == expected.as_slice(),
+            "Read-only mapping mismatch"
+        );
+    }
+    drop(readonly);
+    let private = MappedView::new(&file, PAGE_WRITECOPY, FILE_MAP_COPY)?;
+    unsafe {
+        std::slice::from_raw_parts_mut(private.view.Value.cast::<u8>(), 8192)[..7]
+            .copy_from_slice(b"private");
+    }
+    drop(private);
+    drop(file);
+    ensure!(
+        fs::read(source.join("mapped.bin"))? == expected,
+        "Private mapping changed source"
+    );
+    println!(
+        "NATIVE_WINDOWS_MMAP_PASS: shared cross-page flush, descriptor-close lifetime, read-only and private copy-on-write mappings"
+    );
+    Ok(())
+}
 fn exercise(target: &Path, source: &Path) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -276,12 +358,13 @@ fn exercise(target: &Path, source: &Path) -> Result<()> {
         fs::write(target.join("directory").join(format!("item-{i:03}")), [i])?;
     }
     for _ in 0..2 {
+        let actual = fs::read_dir(target.join("directory"))?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<std::collections::BTreeSet<_>>>()?;
+        let expected = (0..70).map(|i| format!("item-{i:03}")).collect();
         ensure!(
-            fs::read_dir(target.join("directory"))?
-                .collect::<std::io::Result<Vec<_>>>()?
-                .len()
-                == 70,
-            "Directory paging lost entries"
+            actual == expected,
+            "Directory paging lost or duplicated names"
         );
     }
     fs::rename(target.join("directory"), target.join("renamed"))?;
@@ -311,6 +394,22 @@ fn exercise(target: &Path, source: &Path) -> Result<()> {
     println!(
         "NATIVE_WINDOWS_IO_PASS: create, offsets above 4 GiB, flush, truncate, replacement save, directory paging/rename, deletion and errors"
     );
+    let mut free = 0;
+    let mut total = 0;
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            &windows::core::HSTRING::from(target.as_os_str()),
+            Some(&mut free),
+            Some(&mut total),
+            None,
+        )?;
+    }
+    ensure!(
+        total == 4096 * 1_000_000 && free == 4096 * 750_000,
+        "Capacity does not match provider values"
+    );
+    println!("NATIVE_WINDOWS_CAPACITY_PASS: Windows API reports provider capacity");
+    mapped_files(target, source)?;
     Ok(())
 }
 
