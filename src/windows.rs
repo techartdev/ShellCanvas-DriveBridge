@@ -67,7 +67,7 @@ struct Directory {
     eof: bool,
 }
 pub struct Context {
-    _open: crate::mount_gate::OpenGuard,
+    _open: Option<crate::mount_gate::OpenGuard>,
     path: Arc<Mutex<MountPath>>,
     file: Option<u64>,
     directory: Mutex<Directory>,
@@ -177,7 +177,7 @@ impl Fs {
             writable: access & (0x2 | 0x4) != 0 || create != FsCreate::OpenExisting,
         });
         let context = Context {
-            _open: open,
+            _open: crate::windows_handles::blocks_detach(is_dir, access).then_some(open),
             path,
             file,
             directory: Mutex::new(Directory {
@@ -635,6 +635,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
             caps,
         },
     )?;
+    anyhow::ensure!(!crate::windows_drives::reserved(target.to_str().ok_or_else(|| anyhow::anyhow!("Invalid drive letter"))?)?, "Drive letter is mounted or reserved by a network connection");
     host.mount(target)?;
     host.start()?;
     pipe.call(Operation::Report {

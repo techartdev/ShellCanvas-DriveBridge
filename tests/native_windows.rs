@@ -798,12 +798,15 @@ async fn native_windows_mount() -> Result<()> {
     native_scenario(true).await
 }
 
+#[path = "../src/windows_drives.rs"]
+mod windows_drives;
+
 async fn native_scenario(lose_transport: bool) -> Result<()> {
     let drives = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
     ensure!(drives != 0, "Cannot enumerate local drives");
     let letter = (b'D'..=b'Z')
         .rev()
-        .find(|c| drives & (1 << (c - b'A')) == 0)
+        .find(|c| drives & (1 << (c - b'A')) == 0 && matches!(windows_drives::reserved(&format!("{}:", *c as char)), Ok(false)))
         .context("No free test drive")?;
     let mount = format!("{}:", letter as char);
     let target = PathBuf::from(format!("{mount}\\"));
@@ -862,7 +865,14 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         warning(&control, "Metadata-change time is unavailable").await?;
         let p = target.clone(); let source = backing.path().to_owned();
         let volume_name = mount.clone(); let audit = flush_audit.clone();
-        tokio::task::spawn_blocking(move || volume_flush(&volume_name, &p, &source, &audit)).await??;
+        // Opening a volume for direct flushing requires elevated Windows access.
+        // CI exercises this by default; ordinary desktop accounts can explicitly
+        // omit only this privileged subtest while retaining per-file flush tests.
+        if std::env::var("SHELLCANVAS_SKIP_PRIVILEGED_VOLUME_FLUSH").as_deref() == Ok("1") {
+            println!("NATIVE_WINDOWS_VOLUME_FLUSH_NOT_RUN: explicitly omitted privileged volume access; per-file flush remains exercised");
+        } else {
+            tokio::task::spawn_blocking(move || volume_flush(&volume_name, &p, &source, &audit)).await??;
+        }
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || failed_writes(&p, &source)).await??;
         drop(fs::File::open(target.join("close-failed.bin"))?);
@@ -873,6 +883,10 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         warning(&control, "Remote deletion failed during Windows cleanup").await?;
         ensure!(backing.path().join("delete-failed.bin").exists(), "Failed cleanup deletion lost source");
         println!("NATIVE_WINDOWS_WARNING_PASS: close and cleanup deletion failures delivered to the parent");
+        // Explorer keeps read-only folder handles alive. They must not prevent
+        // detach once real file handles have been closed.
+        use std::os::windows::fs::OpenOptionsExt;
+        let browsing = fs::OpenOptions::new().read(true).custom_flags(0x02000000).open(&target)?;
         let held = fs::File::open(target.join("seek.bin"))?;
         control.request_detach()?;
         phase(&control, BridgePhase::Attached).await?;
@@ -883,6 +897,7 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         phase(&control, BridgePhase::Detached).await?;
         ensure!(tokio::time::timeout(Duration::from_secs(10), child.wait()).await??.success(), "Bridge exit failed");
         ensure!(unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() } & (1 << (letter - b'A')) == 0, "Drive remained after detach");
+        drop(browsing);
         println!("NATIVE_WINDOWS_DETACH_PASS: busy file preserved mapping; ordinary detach removed drive after close");
         Ok(())
     }.await;

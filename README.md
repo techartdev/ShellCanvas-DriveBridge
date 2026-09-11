@@ -151,6 +151,11 @@ $env:SHELLCANVAS_NATIVE_WINDOWS_TEST = '1'
 cargo test --locked --test native_windows -- --ignored --nocapture
 ```
 
+The direct volume-flush subtest requires elevated Windows volume access. For a
+normal desktop account, set `SHELLCANVAS_SKIP_PRIVILEGED_VOLUME_FLUSH=1` to explicitly
+omit that subtest; per-file flush and the other native checks still run. The test
+prints the omission, and the default CI path keeps volume-wide flushing enabled.
+
 This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
 
 [CI run 34521265017](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34521265017)

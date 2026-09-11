@@ -15,6 +15,8 @@ mod mount_gate;
 mod probe;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_drives;
 #[cfg(any(windows, test))]
 mod windows_handles;
 #[cfg(any(windows, test))]
