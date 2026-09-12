@@ -94,6 +94,7 @@ jobs:
       - name: Prepare signed manifest and notices
         run: |
           cp LICENSE THIRD-PARTY.md release/
+          node scripts/dependency-notices.mjs release/DEPENDENCY-LICENSES.txt
           node scripts/release-manifest.mjs release "$RELEASE_TAG"
           npm install --no-save @tauri-apps/cli@2.11.4
       - name: Sign release manifest

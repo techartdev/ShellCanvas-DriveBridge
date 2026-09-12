@@ -4,12 +4,29 @@ An optional, free native app for attaching a folder from a ShellCanvas file
 provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
-**Development preview — not an end-user release yet.** Windows, Linux and macOS
-builds pass in CI. A native Linux mount has passed live SFTP file-operation
-checks, and the Windows executable has passed the separate-process SFTP protocol
-test. Windows/macOS native mount acceptance, the ShellCanvas attachment UI,
-installation and graceful busy-detach integration are still in progress.
-Do not treat compilation as verified filesystem compatibility.
+**Preview release:** [download native packages](https://github.com/techartdev/ShellCanvas-DriveBridge/releases/latest)
+for Windows x64, Linux x64, and Intel/Apple silicon macOS. All four packages build
+and pass their automated checks. Windows local mapping, browsing and opening files
+have been tested through ShellCanvas, including a Windows remote drive. Linux
+native SFTP mount checks pass; macOS native mount acceptance remains pending.
+
+## Install
+
+ShellCanvas builds containing the integrated installer offer **Settings → Files →
+Drive Bridge → Install Drive Bridge**. The desktop downloads the package for your
+local computer, verifies its publisher signature and file integrity, and asks you
+to approve installation. No executable picker is needed. The existing ShellCanvas
+0.1.5 release predates this flow; use its local executable installer or wait for
+the next desktop release.
+
+Install WinFsp, your distribution's FUSE runtime, or macFUSE separately. These
+drivers are not bundled or installed automatically. After setup, attach a folder
+or drive from Files. Settings also checks for bridge updates; detach mappings
+before updating. Installation is private to the ShellCanvas profile.
+
+Release assets include a signed `bridge-release.json`, checksums and license
+notices. The signature authenticates the manifest containing each binary's hash
+and size. This is separate from OS code signing or Apple notarization.
 
 ## Architecture
 
@@ -30,7 +47,7 @@ protocol. Simple ShellCanvas adapters need not implement mounting.
 
 | Client | Native integration | Current verification |
 | --- | --- | --- |
-| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Executable builds; native mount test pending |
+| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Native attachment, browsing and opening files confirmed through ShellCanvas; broader application compatibility remains under test |
 | Linux | FUSE kernel interface and the distribution's mount helper | Native x86_64 mount: real SFTP offset I/O, truncate, replacement saves, directory paging, rename with an open file and capacity checks pass |
 | macOS | Separately installed [macFUSE](https://macfuse.github.io/) | macOS 14 CI build passes; native mount verification pending |
 
@@ -91,8 +108,8 @@ it creates and removes test files and must not receive a user's working folder.
   and lifecycle acceptance are still required before release.
 - The FUSE backend uses direct I/O to avoid silently serving a stale file-content
   cache. Memory-mapped application workflows need explicit acceptance testing.
-- Driver setup, live filesystem acceptance and graceful busy detach remain release
-  gates. This preview should not be used for valuable working files yet.
+- Compatibility with additional applications and live macOS mounting remain
+  follow-up work. Keep backups when evaluating this preview.
 
 ## Licensing and commercial distribution
 

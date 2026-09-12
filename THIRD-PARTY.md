@@ -14,5 +14,7 @@ This source repository does not ship filesystem driver installers or binaries.
 - The other Rust dependency versions and checksums are recorded in `Cargo.lock`.
   Cargo package metadata retains their individual license declarations.
 
-Before producing binary releases, include the required license notices for the
-resolved dependency graph and the corresponding GPL source/build materials.
+Binary releases include `DEPENDENCY-LICENSES.txt`, generated from the locked
+Cargo package sources, alongside these notices and the GPLv3 license. Corresponding
+source, the vendored filesystem SDK, build workflow and Cargo lockfile are available
+at the release tag; GitHub also provides source archives on each release.
