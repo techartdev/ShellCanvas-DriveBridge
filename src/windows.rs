@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 use super::*;
+use crate::windows_attributes::attributes;
+use crate::windows_times::{filetime, unix_seconds, validate_unsupported_times};
 use ::windows::Win32::Foundation::*;
 use std::{
     collections::VecDeque,
@@ -48,31 +50,15 @@ fn path(name: &U16CStr) -> winfsp::Result<MountPath> {
             path.child(name).map_err(failure)
         })
 }
-fn timestamp(seconds: Option<u64>) -> u64 {
-    seconds
-        .unwrap_or(0)
-        .saturating_add(11_644_473_600)
-        .saturating_mul(10_000_000)
-}
-fn unix_timestamp(time: u64) -> Option<u64> {
-    (time != 0 && time != u64::MAX).then(|| (time / 10_000_000).saturating_sub(11_644_473_600))
-}
-fn attributes(meta: &FsMetadata) -> u32 {
-    if meta.kind == FsKind::Directory {
-        0x10
-    } else {
-        0x80
-    }
-}
 fn fill(info: &mut FileInfo, meta: &FsMetadata) {
     *info = FileInfo::default();
     info.file_attributes = attributes(meta);
     info.file_size = meta.size;
     info.allocation_size = meta.size.div_ceil(4096).saturating_mul(4096);
-    info.creation_time = timestamp(meta.modified);
-    info.last_write_time = timestamp(meta.modified);
-    info.change_time = timestamp(meta.modified);
-    info.last_access_time = timestamp(meta.accessed);
+    // The portable metadata contract exposes neither birth time nor change time.
+    // Leave these unavailable instead of presenting modification time as both.
+    info.last_write_time = filetime(meta.modified);
+    info.last_access_time = filetime(meta.accessed);
 }
 struct Directory {
     handle: Option<u64>,
@@ -81,16 +67,55 @@ struct Directory {
     eof: bool,
 }
 pub struct Context {
-    path: Mutex<MountPath>,
+    _open: crate::mount_gate::OpenGuard,
+    path: Arc<Mutex<MountPath>>,
     file: Option<u64>,
     directory: Mutex<Directory>,
     is_dir: bool,
+    tracked: Arc<crate::windows_handles::OpenHandle>,
+    pipe: Arc<Pipe>,
 }
 struct Fs {
+    warned_change_time: std::sync::atomic::AtomicBool,
+    handles: crate::windows_handles::OpenHandles,
+    gate: Arc<crate::mount_gate::MountGate>,
     pipe: Arc<Pipe>,
     caps: FsCapabilities,
 }
+impl Drop for Context {
+    fn drop(&mut self) {
+        // Also runs when Create/Open acquired a remote handle but a later
+        // metadata or bookkeeping step failed before WinFsp accepted Context.
+        let mut file = self.tracked.file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = file.take()
+            && let Err(error) = self.pipe.call(Operation::Close { handle })
+        {
+            let message = format!("Remote file close was not confirmed: {error}");
+            eprintln!("{message}");
+            let _ = self.pipe.call(Operation::Report {
+                event: BridgeEvent::Warning { message },
+            });
+        }
+        drop(file);
+        let directory = self.directory.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = directory.handle.take()
+            && let Err(error) = self.pipe.call(Operation::CloseDirectory { handle })
+        {
+            let message = format!("Remote directory close was not confirmed: {error}");
+            eprintln!("{message}");
+            let _ = self.pipe.call(Operation::Report {
+                event: BridgeEvent::Warning { message },
+            });
+        }
+    }
+}
 impl Fs {
+    fn warn(&self, message: String) {
+        eprintln!("{message}");
+        let _ = self.pipe.call(Operation::Report {
+            event: BridgeEvent::Warning { message },
+        });
+    }
     fn call(&self, operation: Operation) -> winfsp::Result<Value> {
         self.pipe.call(operation).map_err(failure)
     }
@@ -119,14 +144,19 @@ impl Fs {
         access: u32,
         create: FsCreate,
         is_dir: bool,
+        open: crate::mount_gate::OpenGuard,
     ) -> winfsp::Result<Context> {
         let file = if is_dir {
             None
         } else {
             // Attribute-only handles need a remote read handle for fstat and
             // stable object identity; the account still controls access.
-            let write = access & (0x2 | 0x4 | 0x100) != 0;
-            let read = access & 0x1 != 0 || !write;
+            let requested_write = access & (0x2 | 0x4) != 0;
+            // Creating an empty file requires write on the SFTP handle even if
+            // the caller requested only read/attribute access. WinFsp enforces
+            // the caller's GrantedAccess; the root must still permit writes.
+            let write = requested_write || create != FsCreate::OpenExisting;
+            let read = access & 0x1 != 0 || !requested_write;
             match self.call(Operation::Open {
                 path: path.clone(),
                 options: FsOpenOptions {
@@ -140,8 +170,15 @@ impl Fs {
                 _ => return Err(invalid()),
             }
         };
-        Ok(Context {
-            path: Mutex::new(path),
+        let path = Arc::new(Mutex::new(path));
+        let tracked = Arc::new(crate::windows_handles::OpenHandle {
+            path: path.clone(),
+            file: Mutex::new(file),
+            writable: access & (0x2 | 0x4) != 0 || create != FsCreate::OpenExisting,
+        });
+        let context = Context {
+            _open: open,
+            path,
             file,
             directory: Mutex::new(Directory {
                 handle: None,
@@ -150,7 +187,11 @@ impl Fs {
                 eof: false,
             }),
             is_dir,
-        })
+            tracked,
+            pipe: self.pipe.clone(),
+        };
+        self.handles.register(&context.tracked).map_err(failure)?;
+        Ok(context)
     }
 }
 impl FileSystemContext for Fs {
@@ -175,6 +216,10 @@ impl FileSystemContext for Fs {
         access: u32,
         info: &mut OpenFileInfo,
     ) -> winfsp::Result<Context> {
+        let open = self
+            .gate
+            .enter()
+            .map_err(|_| FspError::from(STATUS_DEVICE_NOT_CONNECTED))?;
         let path = path(name)?;
         let m = self.path_metadata(path.clone())?;
         let is_dir = m.kind == FsKind::Directory;
@@ -184,7 +229,7 @@ impl FileSystemContext for Fs {
         if options & 0x40 != 0 && is_dir {
             return Err(STATUS_FILE_IS_A_DIRECTORY.into());
         }
-        let context = self.open_context(path, access, FsCreate::OpenExisting, is_dir)?;
+        let context = self.open_context(path, access, FsCreate::OpenExisting, is_dir, open)?;
         fill(info.as_mut(), &m);
         Ok(context)
     }
@@ -193,7 +238,7 @@ impl FileSystemContext for Fs {
         name: &U16CStr,
         options: u32,
         access: u32,
-        _: u32,
+        requested_attributes: u32,
         _: Option<&[c_void]>,
         _: u64,
         _: Option<&[u8]>,
@@ -203,24 +248,39 @@ impl FileSystemContext for Fs {
         if !self.caps.writable {
             return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
         }
+        let open = self
+            .gate
+            .enter()
+            .map_err(|_| FspError::from(STATUS_DEVICE_NOT_CONNECTED))?;
         let path = path(name)?;
         let is_dir = options & 1 != 0;
+        let requested_attributes = crate::windows_attributes::creation_attributes(requested_attributes, is_dir)
+            .map_err(failure)?;
         if is_dir {
             self.call(Operation::Mkdir { path: path.clone() })?;
         }
-        let context = self.open_context(path, access, FsCreate::CreateNew, is_dir)?;
-        fill(info.as_mut(), &self.metadata(&context)?);
+        let context = self.open_context(path, access, FsCreate::CreateNew, is_dir, open)?;
+        let initialized = (|| {
+            let meta = self.metadata(&context)?;
+            if let Some(permissions) = crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)? {
+                self.call(Operation::SetFileMetadata {
+                    handle: context.file.ok_or_else(invalid)?,
+                    metadata: FsSetMetadata { permissions: Some(permissions), ..Default::default() },
+                })?;
+            }
+            fill(info.as_mut(), &self.metadata(&context)?);
+            Ok(())
+        })();
+        if let Err(error) = initialized {
+            // A failed remote metadata call may have taken effect. Do not
+            // delete by path: another remote actor could have replaced it.
+            self.warn("A new remote entry was created but its initial metadata could not be confirmed. Inspect the destination before retrying.".into());
+            return Err(error);
+        }
         Ok(context)
     }
     fn close(&self, context: Context) {
-        if let Some(handle) = context.file {
-            let _ = self.call(Operation::Close { handle });
-        }
-        if let Ok(directory) = context.directory.into_inner() {
-            if let Some(handle) = directory.handle {
-                let _ = self.call(Operation::CloseDirectory { handle });
-            }
-        }
+        drop(context);
     }
     fn get_file_info(&self, context: &Context, info: &mut FileInfo) -> winfsp::Result<()> {
         fill(info, &self.metadata(context)?);
@@ -285,6 +345,10 @@ impl FileSystemContext for Fs {
                 self.call(Operation::Flush { handle })?;
             }
             fill(info, &self.metadata(context)?);
+        } else {
+            self.handles
+                .flush(|handle| self.pipe.call(Operation::Flush { handle }).map(|_| ()))
+                .map_err(failure)?;
         }
         Ok(())
     }
@@ -311,30 +375,56 @@ impl FileSystemContext for Fs {
     fn overwrite(
         &self,
         context: &Context,
-        _: u32,
-        _: bool,
+        requested_attributes: u32,
+        replace_attributes: bool,
         _: u64,
         _: Option<&[u8]>,
         info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        self.set_file_size(context, 0, false, info)
+        if !self.caps.writable {
+            return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
+        }
+        let meta = self.metadata(context)?;
+        let mut requested_attributes = crate::windows_attributes::creation_attributes(requested_attributes, false)
+            .map_err(failure)?;
+        if !replace_attributes {
+            requested_attributes |= attributes(&meta);
+        }
+        // Validate the complete request before truncating an existing file.
+        let permissions = crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)?;
+        self.call(Operation::SetFileMetadata {
+            handle: context.file.ok_or_else(invalid)?,
+            metadata: FsSetMetadata { size: Some(0), permissions, ..Default::default() },
+        })?;
+        fill(info, &self.metadata(context)?);
+        Ok(())
     }
     fn set_basic_info(
         &self,
         context: &Context,
-        _: u32,
-        _: u64,
+        requested_attributes: u32,
+        created: u64,
         access: u64,
         write: u64,
-        _: u64,
+        changed: u64,
         info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        // CopyFileW includes metadata-change time alongside modification time,
+        // then ignores an unsupported result. Preserve representable times and
+        // warn about the omitted change time instead of silently losing mtime.
+        let omitted_change_time = changed != 0 && (access != 0 || write != 0);
+        validate_unsupported_times(created, if omitted_change_time { 0 } else { changed }).map_err(failure)?;
         let metadata = FsSetMetadata {
-            accessed: unix_timestamp(access),
-            modified: unix_timestamp(write),
+            accessed: unix_seconds(access).map_err(failure)?,
+            modified: unix_seconds(write).map_err(failure)?,
+            permissions: crate::windows_attributes::permissions(&self.metadata(context)?, requested_attributes)
+                .map_err(failure)?,
             ..Default::default()
         };
-        if metadata.accessed.is_some() || metadata.modified.is_some() {
+        if metadata.accessed.is_some() || metadata.modified.is_some() || metadata.permissions.is_some() {
+            if !self.caps.writable {
+                return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
+            }
             if let Some(handle) = context.file {
                 self.call(Operation::SetFileMetadata { handle, metadata })?;
             } else {
@@ -345,23 +435,31 @@ impl FileSystemContext for Fs {
             }
         }
         fill(info, &self.metadata(context)?);
+        if omitted_change_time && !self.warned_change_time.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.warn("Metadata-change time is unavailable on this remote filesystem. Requested access/modification times were preserved; change time was omitted.".into());
+        }
         Ok(())
     }
     fn rename(
         &self,
-        context: &Context,
+        _context: &Context,
         old: &U16CStr,
         new: &U16CStr,
         replace: bool,
     ) -> winfsp::Result<()> {
         let to = path(new)?;
-        self.call(Operation::Rename {
-            from: path(old)?,
-            to: to.clone(),
-            replace,
-        })?;
-        *lock(&context.path)? = to;
-        Ok(())
+        let from = path(old)?;
+        self.handles
+            .rename(&from, &to, || {
+                self.pipe
+                    .call(Operation::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                        replace,
+                    })
+                    .map(|_| ())
+            })
+            .map_err(failure)
     }
     fn set_delete(&self, context: &Context, _: &U16CStr, delete: bool) -> winfsp::Result<()> {
         if delete {
@@ -392,13 +490,15 @@ impl FileSystemContext for Fs {
             let target = name
                 .map(path)
                 .unwrap_or_else(|| lock(&context.path).map(|p| p.clone()));
-            if let Ok(path) = target {
-                if let Err(e) = self.call(Operation::Remove {
+            if let Ok(path) = target
+                && let Err(e) = self.call(Operation::Remove {
                     path,
                     directory: context.is_dir,
-                }) {
-                    eprintln!("Remote deletion failed during Windows cleanup: {e}");
-                }
+                })
+            {
+                self.warn(format!(
+                    "Remote deletion failed during Windows cleanup: {e}"
+                ));
             }
         }
     }
@@ -483,10 +583,12 @@ impl FileSystemContext for Fs {
 pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Result<()> {
     // Build against the bundled SDK; load only the separately installed runtime
     // from the machine registry. Never search a writable current directory.
+    let setup = |error| anyhow::anyhow!("WinFsp is unavailable. Install or repair the WinFsp runtime from https://winfsp.dev/rel/, then try attaching again. Driver setup requires administrator approval. Details: {error}");
     let installation = windows_registry::LOCAL_MACHINE
         .open("SOFTWARE\\WOW6432Node\\WinFsp")
-        .or_else(|_| windows_registry::LOCAL_MACHINE.open("SOFTWARE\\WinFsp"))?
-        .get_string("InstallDir")?;
+        .or_else(|_| windows_registry::LOCAL_MACHINE.open("SOFTWARE\\WinFsp"))
+        .map_err(&setup)?
+        .get_string("InstallDir").map_err(&setup)?;
     let dll = if cfg!(target_arch = "aarch64") {
         "winfsp-a64.dll"
     } else {
@@ -501,7 +603,7 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
             None,
             ::windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
                 | ::windows::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )?;
+        ).map_err(|error| anyhow::anyhow!("Cannot load the installed WinFsp runtime at {}. Install or repair WinFsp for this computer from https://winfsp.dev/rel/. Details: {error}", dll.display()))?;
     }
     let _runtime = winfsp::winfsp_init().map_err(|e| {
         anyhow::anyhow!(
@@ -522,23 +624,47 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
         .file_info_timeout(0)
         .flush_and_purge_on_cleanup(true)
         .irp_timeout(60000);
+    let gate = Arc::new(crate::mount_gate::MountGate::default());
     let mut host = FileSystemHost::<_, winfsp::host::CoarseGuard>::new(
         params,
         Fs {
+            warned_change_time: std::sync::atomic::AtomicBool::new(false),
+            handles: crate::windows_handles::OpenHandles::default(),
+            gate: gate.clone(),
             pipe: pipe.clone(),
             caps,
         },
     )?;
     host.mount(target)?;
     host.start()?;
+    pipe.call(Operation::Report {
+        event: BridgeEvent::Ready,
+    })?;
     eprintln!("SHELLCANVAS_BRIDGE_READY");
-    loop {
+    let failure = loop {
         std::thread::sleep(Duration::from_secs(1));
-        if pipe.call(Operation::Capabilities).is_err() {
-            break;
+        match pipe.call(Operation::Poll) {
+            Ok(Value::Directive(BridgeDirective::Continue)) => {}
+            Ok(Value::Directive(BridgeDirective::Detach)) => match gate.begin_detach() {
+                Ok(()) => {
+                    host.unmount();
+                    host.stop();
+                    pipe.call(Operation::Report {
+                        event: BridgeEvent::Detached,
+                    })?;
+                    return Ok(());
+                }
+                Err(message) => {
+                    pipe.call(Operation::Report {
+                        event: BridgeEvent::DetachFailed { message },
+                    })?;
+                }
+            },
+            Err(error) => break format!("Filesystem connection lost: {error}"),
+            Ok(_) => break "Invalid filesystem lifecycle reply".to_owned(),
         }
-    }
+    };
     host.unmount();
     host.stop();
-    Ok(())
+    anyhow::bail!(failure)
 }
