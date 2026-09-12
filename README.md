@@ -5,10 +5,11 @@ provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
 **Development preview — not an end-user release yet.** Windows, Linux and macOS
-builds pass in CI. A native Linux mount has passed live SFTP file-operation
-checks, and the Windows executable has passed the separate-process SFTP protocol
-test. Windows/macOS native mount acceptance, the ShellCanvas attachment UI,
-installation and graceful busy-detach integration are still in progress.
+builds pass in CI. Native Linux mounts pass live SFTP file-operation checks.
+Native Windows mounts pass file-operation, memory-mapping and busy-detach tests
+with WinFsp and a disposable local provider. The Windows executable also passes
+the separate-process SFTP protocol test. A desktop-created Windows SFTP mapping,
+the installation UI and macOS native runtime acceptance remain unverified.
 Do not treat compilation as verified filesystem compatibility.
 
 ## Architecture
@@ -30,7 +31,7 @@ protocol. Simple ShellCanvas adapters need not implement mounting.
 
 | Client | Native integration | Current verification |
 | --- | --- | --- |
-| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Executable builds; native mount test pending |
+| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Native WinFsp 2.1.25156: offset I/O above 4 GiB, truncate, replacement save, paged enumeration, capacity, shared/private/read-only mappings and busy detach pass with a disposable local provider |
 | Linux | FUSE kernel interface and the distribution's mount helper | Native x86_64 mount: real SFTP offset I/O, truncate, replacement saves, directory paging, rename with an open file and capacity checks pass |
 | macOS | Separately installed [macFUSE](https://macfuse.github.io/) | macOS 14 CI build passes; native mount verification pending |
 
@@ -86,13 +87,184 @@ it creates and removes test files and must not receive a user's working folder.
   not provide race-free `openat`/`nofollow` guarantees against concurrent remote
   path replacement.
 - Windows ACLs, alternate data streams, distributed locks, remote hard-link
-  identity and database/VM-image compatibility are not claimed. Windows deletion
-  failure during cleanup currently reports to stderr; visible failure handling
-  and lifecycle acceptance are still required before release.
-- The FUSE backend uses direct I/O to avoid silently serving a stale file-content
-  cache. Memory-mapped application workflows need explicit acceptance testing.
-- Driver setup, live filesystem acceptance and graceful busy detach remain release
-  gates. This preview should not be used for valuable working files yet.
+  identity and database/VM-image compatibility are not claimed. Windows cleanup
+  failures report structured warnings to ShellCanvas as well as stderr. Native
+  failure injection verifies delivery of close/deletion warnings and preservation
+  of the source after failed deletion. Full desktop lifecycle acceptance remains.
+- Windows volume flush visits all writable descriptors, preserving the first
+  failure while attempting the others. Confirmed renames update other open path
+  references; failed renames preserve them. Descriptor drop closes remote handles
+  even when opening failed after the remote handle was acquired. These paths have
+  bookkeeping tests; they still need live WinFsp acceptance. WinFsp's normal Windows
+  rename/share rules may refuse renames while child files are open.
+- The FUSE backend uses direct I/O for ordinary reads/writes. On Linux kernels
+  advertising `FUSE_DIRECT_IO_ALLOW_MMAP`, it also enables shared memory mapping.
+  Native Linux 6.8 acceptance passed shared cross-page writes with `msync`, mapping
+  lifetime after descriptor close, read-only mapping and private copy-on-write
+  mapping; the underlying SFTP source was checked independently. Mapped stores
+  reach the provider when pages are flushed, not on each CPU write. Coherence
+  with concurrent remote edits and database/VM workloads is not promised.
+  Kernels without that capability keep their existing direct-I/O limitations.
+  Windows WinFsp acceptance also passes shared cross-page flush, mapping lifetime
+  after descriptor close, read-only and private copy-on-write maps against a
+  disposable local provider. macOS mapped-file acceptance remains pending. See the
+  [Linux FUSE I/O contract](https://www.kernel.org/doc/html/latest/filesystems/fuse/fuse-io.html).
+- Full desktop setup, failure recovery and modern macOS runtime acceptance remain
+  release gates. This preview should not be used for valuable working files yet.
+
+## Native Windows verification
+
+The opt-in `tests/native_windows.rs` test launches the actual bridge, mounts an
+unused drive letter, exercises ordinary Windows file APIs and inspects the backing
+files independently. It verifies exact directory contents across multiple pages,
+missing/denied/nonempty errors, capacity and memory mapping. An open file must
+prevent detach; a second explicit request after closing it must remove the drive.
+It uses a temporary local provider, no SSH credentials or normal app profile.
+
+[CI run 34511425152](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34511425152)
+passed this test at `30c4125` (27.93 seconds). CI installs the official WinFsp MSI
+only on its disposable Windows runner after checking the pinned SHA-256 and
+Authenticode signer. Ordinary `cargo test` skips this driver-dependent test.
+To run explicitly on a Windows test machine with WinFsp already installed:
+
+```powershell
+$env:SHELLCANVAS_NATIVE_WINDOWS_TEST = '1'
+cargo test --locked --test native_windows -- --ignored --nocapture
+```
+
+This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
+
+[CI run 34521265017](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34521265017)
+at `9c4fbe1` verifies volume-wide flush through a native Windows volume handle.
+Three writable files are attempted even when one provider flush fails, with
+ERROR_IO_DEVICE returned to Windows. After clearing the injected fault, the next
+flush succeeds and backing bytes are independently verified for every file.
+The full native suite passes in 28.88 seconds. This tests propagation of provider
+durability results; physical power-loss behavior remains the storage provider's
+responsibility.
+
+[CI run 34518237898](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34518237898)
+at `e58d386` passes directory rename checks with open handles. Windows rejects
+renaming a directory containing an open child file with error 5; closing the
+child permits rename while two directory handles remain open. Both handles
+continue returning metadata after rename. A failed replacement of a nonempty
+directory preserves both trees. These results match a separate NTFS baseline and
+[Microsoft's FileRenameInformation rules](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/87f86c9b-6c2a-4803-84b7-131a74a434fa).
+Linux/POSIX open-child rename behavior is different. All earlier native Windows
+checks also pass in that run (32.21 seconds).
+
+[CI run 34512537189](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34512537189)
+at `36464c5` also passes write-through failure checks: I/O, offline, timed-out and
+read-only writes return their corresponding Windows errors without changing the
+backing bytes. Failed flush returns an error; unrelated I/O remains usable.
+Failed close and cleanup-time deletion reach the parent as warnings, and failed
+deletion preserves the source file. These are injected provider errors, not a
+real network outage or exhausted remote disk.
+
+[CI run 34513391440](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34513391440)
+at `1459801` additionally cuts both inherited pipe endpoints with a Windows file
+still open. The next write fails within a ten-second deadline, confirmed backing
+bytes remain intact, the bridge exits unsuccessfully and the drive letter is
+removed. Unexpected lifecycle replies or lost connections now produce a failure
+exit on Windows and FUSE. Normal explicit detach still exits successfully.
+This exercises real bridge transport loss; SSH network interruption is separate.
+
+Normal FUSE detach uses the ordinary system unmount helper and preserves a busy
+mount. Abnormal process/session teardown also involves `fuser`'s own cleanup;
+its fallback can use lazy/forced unmount depending on the platform. Linux 6.8
+acceptance as root at `1459801` cuts the actual pipes with a local file open over
+the core SFTP provider: write and close return ENOTCONN, confirmed source bytes
+remain unchanged, the helper exits unsuccessfully and the native mount table
+shows removal. The fixture and staged binary were then verified removed.
+Modern macOS failure cleanup remains unverified. Non-root Linux results follow.
+ShellCanvas retains failed mappings for
+inspection and verifies the OS mount table before releasing cleanup ownership.
+
+At `87a28c9`, directory rewind recovery clears retired remote handles and buffered
+entries before reopening, including failures followed by a seek to a later
+position. Linux/macOS regression tests cover close/reopen failures and invalid
+replies; all platform jobs pass in [CI run 34519068114](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34519068114).
+The Linux artifact also passes native Linux 6.8 testing through the core SFTP
+provider: repeated rewinds of the same directory descriptor return exact paged
+contents, including after renaming the open directory. The earlier I/O, mmap and
+busy-detach checks pass, with independently confirmed fixture/mount cleanup.
+This does not establish native injected-reopen-failure acceptance.
+
+The same `87a28c9` Linux artifact also passes as an unprivileged mounting user
+(UID 65534) on Linux 6.8 using the installed setuid `fusermount3` helper. Local
+file operations, rewinds/renames, memory mapping, busy-detach protection and
+ordinary unmount pass. Source bytes are independently checked by the source
+owner. Cutting both bridge pipes with a file open returns ENOTCONN for write and
+close, preserves confirmed source bytes, produces a failure exit and removes the
+mount without privileged recovery. Both disposable fixture trees, mounts and
+the staged binary were independently confirmed removed. No system FUSE settings
+or accounts were changed for the test.
+
+The core's `native_bridge_probe` has an opt-in
+`SHELLCANVAS_PROBE_UNPRIVILEGED=1` mode for this existing-account test; combine it
+with `SHELLCANVAS_PROBE_TRANSPORT_LOSS=1` for pipe-loss acceptance. This result is
+specific to that Linux/runtime combination, not a guarantee for every distribution.
+
+Inode lifetime regressions pass at `558d1f2` in
+[CI run 34521983619](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34521983619).
+They cover both orders of releasing kernel references and open handles, and
+ensure retiring an old inode cannot remove a recreated path. Its Linux artifact
+also passes native Linux 6.8 acceptance as UID 65534 through the core SFTP
+provider: unlink/recreate gives a distinct inode, the old open descriptor keeps
+reading/writing its original object, and closing it leaves the replacement
+unchanged. The source owner independently verifies replacement bytes. Earlier
+directory rewind, mmap, busy detach and ordinary unmount checks pass; fixture,
+mount and staged binary removal were independently confirmed. All platform CI
+jobs and native Windows checks pass. Concurrent edits by another remote client
+remain outside this evidence.
+
+### Windows read-only attributes
+
+Existing regular files expose read-only when their Unix permission bits contain
+no write permission. Setting read-only through `SetFileAttributes` removes all
+write bits; clearing it restores owner write only, preserving read/execute bits
+and never adding group/other write. This is a permission projection, not a full
+Windows ACL or effective-access calculation. The remote account still determines
+which operations are allowed. Use a matching updated core: attribute-only opens
+use a remote read handle, and non-size metadata changes require a writable root.
+Read handles cannot truncate and read-only roots cannot change metadata.
+
+`SetBasicInfo` rejects hidden/system/archive and other unsupported DOS flags
+before changing timestamps or permissions. Directory read-only changes, absent
+permissions and transitions involving special Unix mode bits also report
+unsupported instead of silently changing unrelated permissions. Creation and
+overwrite attribute requests remain review items; this implementation does not
+claim full DOS-attribute persistence.
+
+The mapping and rejection regressions pass at `447b1c3`. Native WinFsp acceptance
+in [CI run 34523633220](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34523633220)
+checks read-only set/clear against backing metadata, rejected writes/deletion,
+and rejection of a combined hidden/read-only request without partial changes.
+The core's live SFTP probe separately verifies metadata changes through a read
+handle, rejected truncation and read-only-root enforcement. These are separate
+provider and bridge checks; desktop-created Windows SFTP acceptance remains open.
+
+### Windows timestamps
+
+The portable contract exposes access/modification times at whole-second
+precision. Creation and metadata-change times remain unavailable (zero in the
+Windows response), rather than being synthesized from modification time. Missing
+or unrepresentable provider timestamps likewise remain unavailable. Explicit
+creation/change-time updates and dates before the Unix epoch return unsupported
+before changing any other requested metadata. Providers may reject narrower
+ranges; SFTP v3 has unsigned 32-bit seconds. Applications requiring preservation
+of creation time must handle that unsupported result.
+
+At `3f66501`, [CI run 34524595837](https://github.com/techartdev/ShellCanvas-DriveBridge/actions/runs/34524595837)
+passes native Windows access/modification readback through an attribute-only
+handle and rejection of unsupported mixed requests without partial changes.
+Earlier native checks, all platform builds/tests and Windows clippy also pass.
+A separate live core SFTP check confirms single-field updates preserve the other
+timestamp and an out-of-range time combined with permissions has no partial
+effect. This is not proof that a provider supports birth/change-time storage.
+
+The callback follows [WinFsp's SetBasicInfo contract](https://winfsp.dev/doc/WinFsp-API-winfsp.h/):
+zero time values leave the respective timestamp unchanged.
 
 ## Licensing and commercial distribution
 

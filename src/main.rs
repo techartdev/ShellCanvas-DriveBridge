@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 use shellcanvas_filesystem_sdk::{
+    bridge_control::{BridgeDirective, BridgeEvent},
     wire::{Client, Operation, Value},
     *,
 };
@@ -9,9 +10,17 @@ use std::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fuse;
+#[cfg(any(windows, test))]
+mod mount_gate;
 mod probe;
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_handles;
+#[cfg(any(windows, test))]
+mod windows_attributes;
+#[cfg(any(windows, test))]
+mod windows_times;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
