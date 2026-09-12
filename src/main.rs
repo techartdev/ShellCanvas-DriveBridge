@@ -15,6 +15,10 @@ mod windows;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.len() == 2 && args[1] == "--version" {
+        println!("ShellCanvas Drive Bridge {} (protocol 1)", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.len() == 2 && args[1] == "--licenses" {
         println!(
             "ShellCanvas Drive Bridge: GPL-3.0-only. Free software; commercial use is permitted under its license.\n\n{}",

@@ -1,0 +1,106 @@
+name: Publish signed Drive Bridge packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (vX.Y.Z)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: bridge-release-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rust: x86_64-pc-windows-msvc
+            target: windows-x86_64
+          - os: ubuntu-22.04
+            rust: x86_64-unknown-linux-gnu
+            target: linux-x86_64
+          - os: macos-14
+            rust: aarch64-apple-darwin
+            target: macos-aarch64
+          - os: macos-15-intel
+            rust: x86_64-apple-darwin
+            target: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      BRIDGE_TARGET: ${{ matrix.target }}
+      RUST_TARGET: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Validate release version
+        shell: bash
+        run: |
+          node -e 'const fs=require("fs"); const tag=process.env.RELEASE_TAG; if(!/^v\d+\.\d+\.\d+$/.test(tag)||!fs.readFileSync("Cargo.toml","utf8").includes(`version = "${tag.slice(1)}"`)) process.exit(1)'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust }}
+      - name: Windows binding generator
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install libclang==18.1.1
+          $clang = python -c "import clang.cindex; print(clang.cindex.Config.library_path)"
+          "LIBCLANG_PATH=$clang" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: macOS build prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config
+          brew install --cask macfuse
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked --target ${{ matrix.rust }}
+      - run: cargo test --locked --workspace --target ${{ matrix.rust }}
+      - name: Prepare executable
+        shell: bash
+        run: |
+          mkdir -p release
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; fi
+          cp "target/$RUST_TARGET/release/shellcanvas-drive-bridge$suffix" "release/shellcanvas-drive-bridge-${RELEASE_TAG#v}-$BRIDGE_TARGET$suffix"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release/*
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Prepare signed manifest and notices
+        run: |
+          cp LICENSE THIRD-PARTY.md release/
+          node scripts/release-manifest.mjs release "$RELEASE_TAG"
+          npm install --no-save @tauri-apps/cli@2.11.4
+      - name: Sign release manifest
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.BRIDGE_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: npx tauri signer sign release/bridge-release.json > /dev/null
+      - name: Publish complete release
+        run: |
+          gh release create "$RELEASE_TAG" release/* --verify-tag --title "Drive Bridge $RELEASE_TAG" --notes-file RELEASE-NOTES.md
