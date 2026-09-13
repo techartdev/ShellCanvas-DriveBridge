@@ -146,11 +146,17 @@ impl Fs {
         is_dir: bool,
         open: crate::mount_gate::OpenGuard,
     ) -> winfsp::Result<Context> {
-        let file = if is_dir {
+        let file = if is_dir
+            || (create == FsCreate::OpenExisting && access & (0x1 | 0x2 | 0x4 | 0x10 | 0x100) == 0)
+        {
             None
         } else {
-            // Attribute-only handles need a remote read handle for fstat and
-            // stable object identity; the account still controls access.
+            // Data access and writable metadata retain stable provider
+            // handles so updates keep addressing the opened object. Opening a
+            // read handle for DELETE/READ_ATTRIBUTES unnecessarily acquires a
+            // Windows server sharing restriction and can block our own rename.
+            // Read-only metadata/namespace contexts use path operations;
+            // WinFsp still enforces the caller's access and sharing locally.
             let requested_write = access & (0x2 | 0x4) != 0;
             // Creating an empty file requires write on the SFTP handle even if
             // the caller requested only read/attribute access. WinFsp enforces

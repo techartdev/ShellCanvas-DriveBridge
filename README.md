@@ -4,7 +4,7 @@ An optional, free native app for attaching a folder from a ShellCanvas file
 provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
-**Preview release 0.1.1:** [download native packages](https://github.com/techartdev/ShellCanvas-DriveBridge/releases/latest)
+**Preview release 0.1.2:** [download native packages](https://github.com/techartdev/ShellCanvas-DriveBridge/releases/latest)
 for Windows x64, Linux x64, and Intel/Apple silicon macOS. Windows, Linux and
 macOS builds pass in CI. Native Linux mounts pass live SFTP file-operation checks.
 Native Windows mounts pass file-operation, memory-mapping and busy-detach tests
@@ -92,11 +92,16 @@ it creates and removes test files and must not receive a user's working folder.
 
 ## Current semantics and limitations
 
-- On the tested Windows OpenSSH host, a second reader while a writable remote
-  handle remained open and native rename returned I/O errors. Save-close-open,
-  independent SFTP byte verification, busy detach and ordinary detach passed.
-  Rejected rename preserved source bytes. Local-provider native tests do not
-  establish these Windows SFTP semantics; further compatibility work is needed.
+- Version 0.1.2 avoids acquiring a remote data-read handle for read-only metadata
+  and namespace operations. With ShellCanvas 0.1.6, closed-file rename/delete,
+  save-close-open, independently verified SFTP bytes and detach pass on the tested
+  Windows host. Writable metadata and data handles retain their object identity.
+- Simultaneous readers/writers and renaming an open file may still fail through
+  Windows SFTP, even when the local application's Windows sharing flags permit
+  them. These are accepted server/protocol limitations. Handles that deny sharing
+  must still block access; no remote helper or lock-bypassing workaround is used.
+  An upstream improvement may help, but must be tested before claiming parity.
+  See the [Windows comparison](https://github.com/techartdev/ShellCanvas/blob/main/docs/windows-filesystem-behavior.md).
 
 - Read/write requests use bounded chunks and real offsets; the whole remote tree
   is not downloaded or indexed before use. Directory pages are consumed lazily.
