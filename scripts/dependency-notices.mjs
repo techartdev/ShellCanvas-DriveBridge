@@ -17,6 +17,8 @@ for (const pkg of packages) {
   // Published winfsp-rs crates declare GPL-3.0 without shipping the text.
   // Include the complete GPLv3 text shipped by this GPL-3.0-only project.
   if (!files.length && ['winfsp', 'winfsp-sys'].includes(pkg.name)) files = ['LICENSE'];
+  // r-efi ships its complete MIT grant and copyright notices inside AUTHORS.
+  if (!files.length && pkg.name === 'r-efi') files = [join(root, 'AUTHORS')];
   if (!files.length) throw new Error(`Missing license text for ${pkg.name} ${pkg.version}`);
   sections.push(`\n===== ${pkg.name} ${pkg.version} =====\nLicense: ${pkg.license ?? 'see text'}\nAuthors: ${(pkg.authors ?? []).join(', ')}\nRepository: ${pkg.repository ?? ''}\n${files.map(p => readFileSync(p, 'utf8')).join('\n')}`);
 }
