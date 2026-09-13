@@ -4,13 +4,31 @@ An optional, free native app for attaching a folder from a ShellCanvas file
 provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
-**Development preview — not an end-user release yet.** Windows, Linux and macOS
-builds pass in CI. Native Linux mounts pass live SFTP file-operation checks.
+**Preview release 0.1.1:** [download native packages](https://github.com/techartdev/ShellCanvas-DriveBridge/releases/latest)
+for Windows x64, Linux x64, and Intel/Apple silicon macOS. Windows, Linux and
+macOS builds pass in CI. Native Linux mounts pass live SFTP file-operation checks.
 Native Windows mounts pass file-operation, memory-mapping and busy-detach tests
 with WinFsp and a disposable local provider. The Windows executable also passes
-the separate-process SFTP protocol test. A desktop-created Windows SFTP mapping,
-the installation UI and macOS native runtime acceptance remain unverified.
+the separate-process SFTP protocol test. Desktop-created Windows SFTP mapping, browsing and opening files have been manually confirmed. macOS native runtime acceptance remains pending.
 Do not treat compilation as verified filesystem compatibility.
+
+## Install
+
+ShellCanvas builds containing the integrated installer offer **Settings → Files →
+Drive Bridge → Install Drive Bridge**. The desktop downloads the package for your
+local computer, verifies its publisher signature and file integrity, and asks you
+to approve installation. No executable picker is needed. The existing ShellCanvas
+0.1.5 release predates this flow; use its local executable installer or wait for
+the next desktop release.
+
+Install WinFsp, your distribution's FUSE runtime, or macFUSE separately. These
+drivers are not bundled or installed automatically. After setup, attach a folder
+or drive from Files. Settings also checks for bridge updates; detach mappings
+before updating. Installation is private to the ShellCanvas profile.
+
+Release assets include a signed `bridge-release.json`, checksums and license
+notices. The signature authenticates the manifest containing each binary's hash
+and size. This is separate from OS code signing or Apple notarization.
 
 ## Architecture
 
@@ -31,7 +49,7 @@ protocol. Simple ShellCanvas adapters need not implement mounting.
 
 | Client | Native integration | Current verification |
 | --- | --- | --- |
-| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Native WinFsp 2.1.25156: offset I/O above 4 GiB, truncate, replacement save, paged enumeration, capacity, shared/private/read-only mappings and busy detach pass with a disposable local provider |
+| Windows x64 | Separately installed [WinFsp](https://winfsp.dev/rel/); system administrator approval for the driver | Native WinFsp 2.1.25156: offset I/O above 4 GiB, truncate, replacement save, paged enumeration, capacity, shared/private/read-only mappings and busy detach pass with a disposable local provider; attachment, browsing and opening files are also confirmed through ShellCanvas |
 | Linux | FUSE kernel interface and the distribution's mount helper | Native x86_64 mount: real SFTP offset I/O, truncate, replacement saves, directory paging, rename with an open file and capacity checks pass |
 | macOS | Separately installed [macFUSE](https://macfuse.github.io/) | macOS 14 CI build passes; native mount verification pending |
 
@@ -73,6 +91,12 @@ terminal without the host protocol will not establish a connection. The internal
 it creates and removes test files and must not receive a user's working folder.
 
 ## Current semantics and limitations
+
+- On the tested Windows OpenSSH host, a second reader while a writable remote
+  handle remained open and native rename returned I/O errors. Save-close-open,
+  independent SFTP byte verification, busy detach and ordinary detach passed.
+  Rejected rename preserved source bytes. Local-provider native tests do not
+  establish these Windows SFTP semantics; further compatibility work is needed.
 
 - Read/write requests use bounded chunks and real offsets; the whole remote tree
   is not downloaded or indexed before use. Directory pages are consumed lazily.
@@ -131,6 +155,11 @@ To run explicitly on a Windows test machine with WinFsp already installed:
 $env:SHELLCANVAS_NATIVE_WINDOWS_TEST = '1'
 cargo test --locked --test native_windows -- --ignored --nocapture
 ```
+
+The direct volume-flush subtest requires elevated Windows volume access. For a
+normal desktop account, set `SHELLCANVAS_SKIP_PRIVILEGED_VOLUME_FLUSH=1` to explicitly
+omit that subtest; per-file flush and the other native checks still run. The test
+prints the omission, and the default CI path keeps volume-wide flushing enabled.
 
 This is not Explorer/editor UI acceptance or an end-to-end desktop/SFTP test.
 

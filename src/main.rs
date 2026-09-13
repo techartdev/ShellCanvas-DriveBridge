@@ -16,16 +16,22 @@ mod probe;
 #[cfg(windows)]
 mod windows;
 #[cfg(any(windows, test))]
-mod windows_handles;
-#[cfg(any(windows, test))]
 mod windows_attributes;
+#[cfg(windows)]
+mod windows_drives;
+#[cfg(any(windows, test))]
+mod windows_handles;
 #[cfg(any(windows, test))]
 mod windows_times;
 type Pipe = Client<Stdin, Stdout>;
 fn main() -> anyhow::Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
     if args.len() == 2 && args[1] == "--version" {
-        println!("ShellCanvas Drive Bridge {} (protocol 1)", env!("CARGO_PKG_VERSION"));
+        println!(
+            "ShellCanvas Drive Bridge {} (protocol {})",
+            env!("CARGO_PKG_VERSION"),
+            shellcanvas_filesystem_sdk::wire::PROTOCOL
+        );
         return Ok(());
     }
     if args.len() == 2 && args[1] == "--licenses" {

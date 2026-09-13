@@ -50,7 +50,11 @@ fn metadata(m: fs::Metadata) -> FsMetadata {
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs()),
-        permissions: Some(if m.permissions().readonly() { 0o444 } else { 0o644 }),
+        permissions: Some(if m.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        }),
     }
 }
 fn set(file: &fs::File, m: FsSetMetadata) -> std::io::Result<()> {
@@ -125,7 +129,9 @@ impl MountedFile for LocalFile {
     async fn flush(&self) -> FsResult<()> {
         self.2.seen.lock().unwrap().push(self.1.clone());
         if self.1 == "flush-failed.bin"
-            || (self.1 == "volume-failed.bin" && self.2.fail_volume.load(std::sync::atomic::Ordering::SeqCst)) {
+            || (self.1 == "volume-failed.bin"
+                && self.2.fail_volume.load(std::sync::atomic::Ordering::SeqCst))
+        {
             return Err(FsError::new(FsErrorKind::Io, "Injected flush failure"));
         }
         self.with(|f| f.sync_all())
@@ -210,8 +216,11 @@ impl MountedFileSystem for LocalRoot {
         // Model a provider that permits owner metadata changes on a data-read
         // handle, as SFTP FSETSTAT does. This must not request data-write access.
         use std::os::windows::fs::OpenOptionsExt;
-        file.access_mode((if options.read { 0x80000000 } else { 0 })
-            | (if options.write { 0x40000000 } else { 0 }) | 0x100);
+        file.access_mode(
+            (if options.read { 0x80000000 } else { 0 })
+                | (if options.write { 0x40000000 } else { 0 })
+                | 0x100,
+        );
         match options.create {
             FsCreate::OpenExisting => {}
             FsCreate::CreateNew => {
@@ -243,8 +252,15 @@ impl MountedFileSystem for LocalRoot {
         fs::create_dir(self.path(path)).map_err(error)
     }
     async fn remove(&self, path: &MountPath, directory: bool) -> FsResult<()> {
-        if path.components().last().is_some_and(|p| p == "delete-failed.bin") {
-            return Err(FsError::new(FsErrorKind::PermissionDenied, "Injected cleanup deletion failure"));
+        if path
+            .components()
+            .last()
+            .is_some_and(|p| p == "delete-failed.bin")
+        {
+            return Err(FsError::new(
+                FsErrorKind::PermissionDenied,
+                "Injected cleanup deletion failure",
+            ));
         }
         if directory {
             fs::remove_dir(self.path(path))
@@ -286,12 +302,19 @@ async fn phase(control: &BridgeControl, expected: BridgePhase) -> Result<()> {
 async fn warning(control: &BridgeControl, fragment: &str) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if control.snapshot()?.message.as_deref().is_some_and(|m| m.contains(fragment)) {
+            if control
+                .snapshot()?
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains(fragment))
+            {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }).await.context("Expected cleanup warning was not delivered")?
+    })
+    .await
+    .context("Expected cleanup warning was not delivered")?
 }
 
 fn failed_writes(target: &Path, source: &Path) -> Result<()> {
@@ -303,23 +326,45 @@ fn failed_writes(target: &Path, source: &Path) -> Result<()> {
         ("write-timeout.bin", ERROR_SEM_TIMEOUT),
         ("write-readonly.bin", ERROR_WRITE_PROTECT),
     ] {
-        let mut file = fs::OpenOptions::new().write(true)
-            .custom_flags(FILE_FLAG_WRITE_THROUGH.0).open(target.join(name))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_WRITE_THROUGH.0)
+            .open(target.join(name))?;
         // Write-through makes success depend on the provider, not just dirtying
         // a Windows cache page. Never replay the failed mutation automatically.
-        let error = file.write_all(b"must not be acknowledged").expect_err("Failed write reported success");
-        ensure!(error.raw_os_error() == Some(code.0 as i32), "{name}: wrong native status: {error}");
+        let error = file
+            .write_all(b"must not be acknowledged")
+            .expect_err("Failed write reported success");
+        ensure!(
+            error.raw_os_error() == Some(code.0 as i32),
+            "{name}: wrong native status: {error}"
+        );
         drop(file);
-        ensure!(fs::read(source.join(name))? == b"original", "{name}: failed write changed source");
+        ensure!(
+            fs::read(source.join(name))? == b"original",
+            "{name}: failed write changed source"
+        );
     }
-    let file = fs::OpenOptions::new().write(true).open(target.join("flush-failed.bin"))?;
-    let error = file.sync_all().expect_err("Failed durable flush reported success");
-    ensure!(error.raw_os_error() == Some(ERROR_IO_DEVICE.0 as i32), "Wrong flush status: {error}");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(target.join("flush-failed.bin"))?;
+    let error = file
+        .sync_all()
+        .expect_err("Failed durable flush reported success");
+    ensure!(
+        error.raw_os_error() == Some(ERROR_IO_DEVICE.0 as i32),
+        "Wrong flush status: {error}"
+    );
     drop(file);
     // Per-operation failure must not poison unrelated handles or the attachment.
     fs::write(target.join("healthy-after-error.bin"), b"healthy")?;
-    ensure!(fs::read(source.join("healthy-after-error.bin"))? == b"healthy", "Attachment did not recover from operation failure");
-    println!("NATIVE_WINDOWS_FAILURE_PASS: failed/offline/timed-out/read-only writes and flush errors reach Windows; source preserved; unrelated I/O remains usable");
+    ensure!(
+        fs::read(source.join("healthy-after-error.bin"))? == b"healthy",
+        "Attachment did not recover from operation failure"
+    );
+    println!(
+        "NATIVE_WINDOWS_FAILURE_PASS: failed/offline/timed-out/read-only writes and flush errors reach Windows; source preserved; unrelated I/O remains usable"
+    );
     Ok(())
 }
 struct MappedView {
@@ -414,49 +459,82 @@ fn rename_open_directory(target: &Path, source: &Path) -> Result<()> {
     fs::write(original.join("child.txt"), b"before")?;
     // Two independent directory contexts must both follow a confirmed rename.
     // Their metadata callback uses a path rather than a remote file descriptor.
-    let open_directory = || fs::OpenOptions::new().read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0).open(&original);
+    let open_directory = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(&original)
+    };
     let first = open_directory()?;
     let second = open_directory()?;
-    let mut child = fs::OpenOptions::new().read(true).write(true)
+    let mut child = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
         .open(original.join("child.txt"))?;
     // Windows FileRenameInformation rejects a directory containing open files.
     // Verified against native NTFS as well as the Microsoft MS-FSA specification.
     // Keep the Windows rule instead of imposing POSIX descendant-rename behavior.
-    let busy = fs::rename(&original, &renamed).expect_err("Renamed a directory containing an open file");
-    ensure!(busy.raw_os_error() == Some(5), "Unexpected open-descendant rename error: {busy}");
-    ensure!(first.metadata()?.is_dir() && second.metadata()?.is_dir(),
-        "Rejected rename changed open directory aliases");
+    let busy =
+        fs::rename(&original, &renamed).expect_err("Renamed a directory containing an open file");
+    ensure!(
+        busy.raw_os_error() == Some(5),
+        "Unexpected open-descendant rename error: {busy}"
+    );
+    ensure!(
+        first.metadata()?.is_dir() && second.metadata()?.is_dir(),
+        "Rejected rename changed open directory aliases"
+    );
     child.seek(SeekFrom::Start(0))?;
     child.write_all(b"after!")?;
     child.sync_all()?;
-    ensure!(fs::read(source.join("open-directory/child.txt"))? == b"after!",
-        "Rejected directory rename changed the open child");
+    ensure!(
+        fs::read(source.join("open-directory/child.txt"))? == b"after!",
+        "Rejected directory rename changed the open child"
+    );
     drop(child);
-    fs::rename(&original, &renamed).context("Rename after closing descendant, with directory aliases open")?;
-    ensure!(first.metadata()?.is_dir() && second.metadata()?.is_dir(),
-        "Open directory aliases lost metadata after rename");
-    ensure!(fs::read(source.join("moved-directory/child.txt"))? == b"after!",
-        "Directory rename changed child contents");
-    ensure!(!source.join("open-directory").exists(), "Old directory path remained");
+    fs::rename(&original, &renamed)
+        .context("Rename after closing descendant, with directory aliases open")?;
+    ensure!(
+        first.metadata()?.is_dir() && second.metadata()?.is_dir(),
+        "Open directory aliases lost metadata after rename"
+    );
+    ensure!(
+        fs::read(source.join("moved-directory/child.txt"))? == b"after!",
+        "Directory rename changed child contents"
+    );
+    ensure!(
+        !source.join("open-directory").exists(),
+        "Old directory path remained"
+    );
 
     let blocked = target.join("blocked-directory");
     fs::create_dir(&blocked)?;
     fs::write(blocked.join("sentinel.txt"), b"keep")?;
-    ensure!(fs::rename(&renamed, &blocked).is_err(),
-        "Rename unexpectedly replaced a nonempty directory");
-    ensure!(first.metadata()?.is_dir() && second.metadata()?.is_dir(),
-        "Failed rename changed open directory aliases");
-    ensure!(fs::read(renamed.join("child.txt"))? == b"after!", "Failed rename changed the child");
-    ensure!(fs::read(source.join("blocked-directory/sentinel.txt"))? == b"keep",
-        "Failed rename damaged the destination");
+    ensure!(
+        fs::rename(&renamed, &blocked).is_err(),
+        "Rename unexpectedly replaced a nonempty directory"
+    );
+    ensure!(
+        first.metadata()?.is_dir() && second.metadata()?.is_dir(),
+        "Failed rename changed open directory aliases"
+    );
+    ensure!(
+        fs::read(renamed.join("child.txt"))? == b"after!",
+        "Failed rename changed the child"
+    );
+    ensure!(
+        fs::read(source.join("blocked-directory/sentinel.txt"))? == b"keep",
+        "Failed rename damaged the destination"
+    );
     drop(second);
     drop(first);
     fs::remove_file(renamed.join("child.txt"))?;
     fs::remove_dir(&renamed)?;
     fs::remove_file(blocked.join("sentinel.txt"))?;
     fs::remove_dir(&blocked)?;
-    println!("NATIVE_WINDOWS_OPEN_RENAME_PASS: open child blocks directory rename without damage; closing child permits rename with directory aliases open; failed replacement preserves both trees");
+    println!(
+        "NATIVE_WINDOWS_OPEN_RENAME_PASS: open child blocks directory rename without damage; closing child permits rename with directory aliases open; failed replacement preserves both trees"
+    );
     Ok(())
 }
 
@@ -465,61 +543,127 @@ fn volume_flush(mount: &str, target: &Path, source: &Path, audit: &FlushAudit) -
     use windows::Win32::Foundation::ERROR_IO_DEVICE;
     // The drive letter was selected from GetLogicalDrives before mounting this
     // disposable bridge. Never open any physical disk or another volume here.
-    let volume = fs::OpenOptions::new().read(true).write(true)
-        .open(format!(r"\\.\{mount}")).context("Open disposable bridge volume for flushing")?;
+    let volume = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!(r"\\.\{mount}"))
+        .context("Open disposable bridge volume for flushing")?;
     let names = ["volume-first.bin", "volume-failed.bin", "volume-last.bin"];
     let mut files = Vec::new();
     for name in names {
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(target.join(name))?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target.join(name))?;
         file.write_all(name.as_bytes())?;
         files.push(file);
     }
     audit.fail_volume.store(true, Ordering::SeqCst);
     audit.seen.lock().unwrap().clear();
-    let failure = volume.sync_all().expect_err("Volume flush acknowledged a failed file flush");
-    ensure!(failure.raw_os_error() == Some(ERROR_IO_DEVICE.0 as i32), "Wrong volume flush error: {failure}");
+    let failure = volume
+        .sync_all()
+        .expect_err("Volume flush acknowledged a failed file flush");
+    ensure!(
+        failure.raw_os_error() == Some(ERROR_IO_DEVICE.0 as i32),
+        "Wrong volume flush error: {failure}"
+    );
     let seen = audit.seen.lock().unwrap().clone();
     for name in names {
-        ensure!(seen.iter().any(|item| item == name), "Volume flush skipped {name}: {seen:?}");
+        ensure!(
+            seen.iter().any(|item| item == name),
+            "Volume flush skipped {name}: {seen:?}"
+        );
     }
     audit.fail_volume.store(false, Ordering::SeqCst);
     audit.seen.lock().unwrap().clear();
-    volume.sync_all().context("Volume flush did not recover after provider failure cleared")?;
+    volume
+        .sync_all()
+        .context("Volume flush did not recover after provider failure cleared")?;
     let seen = audit.seen.lock().unwrap().clone();
     for name in names {
-        ensure!(seen.iter().any(|item| item == name), "Successful volume flush skipped {name}: {seen:?}");
-        ensure!(fs::read(source.join(name))? == name.as_bytes(), "Volume flush did not persist {name}");
+        ensure!(
+            seen.iter().any(|item| item == name),
+            "Successful volume flush skipped {name}: {seen:?}"
+        );
+        ensure!(
+            fs::read(source.join(name))? == name.as_bytes(),
+            "Volume flush did not persist {name}"
+        );
     }
     drop(files);
     drop(volume);
-    println!("NATIVE_WINDOWS_VOLUME_FLUSH_PASS: native volume flush visits every writer, reports a provider failure and succeeds with independently verified bytes after recovery");
+    println!(
+        "NATIVE_WINDOWS_VOLUME_FLUSH_PASS: native volume flush visits every writer, reports a provider failure and succeeds with independently verified bytes after recovery"
+    );
     Ok(())
 }
 
 fn file_attributes(target: &Path, source: &Path) -> Result<()> {
-    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    use windows::{Win32::Storage::FileSystem::*, core::HSTRING};
     let path = target.join("attributes.txt");
     let backing = source.join("attributes.txt");
     fs::write(&path, b"preserve")?;
-    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_READONLY)?; }
-    ensure!(fs::metadata(&path)?.permissions().readonly(), "Mapped read-only attribute not reported");
-    ensure!(fs::metadata(&backing)?.permissions().readonly(), "Read-only change did not reach provider");
-    ensure!(fs::OpenOptions::new().write(true).open(&path).is_err(), "Read-only file allowed a new writer");
-    ensure!(fs::remove_file(&path).is_err(), "Read-only file allowed deletion");
-    ensure!(fs::read(&path)? == b"preserve", "Read-only file contents changed");
-    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
-    ensure!(!fs::metadata(&path)?.permissions().readonly(), "Mapped read-only attribute not cleared");
-    ensure!(!fs::metadata(&backing)?.permissions().readonly(), "Clearing read-only did not reach provider");
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_READONLY)?;
+    }
+    ensure!(
+        fs::metadata(&path)?.permissions().readonly(),
+        "Mapped read-only attribute not reported"
+    );
+    ensure!(
+        fs::metadata(&backing)?.permissions().readonly(),
+        "Read-only change did not reach provider"
+    );
+    ensure!(
+        fs::OpenOptions::new().write(true).open(&path).is_err(),
+        "Read-only file allowed a new writer"
+    );
+    ensure!(
+        fs::remove_file(&path).is_err(),
+        "Read-only file allowed deletion"
+    );
+    ensure!(
+        fs::read(&path)? == b"preserve",
+        "Read-only file contents changed"
+    );
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?;
+    }
+    ensure!(
+        !fs::metadata(&path)?.permissions().readonly(),
+        "Mapped read-only attribute not cleared"
+    );
+    ensure!(
+        !fs::metadata(&backing)?.permissions().readonly(),
+        "Clearing read-only did not reach provider"
+    );
     let unsupported = unsafe {
-        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY)
+        SetFileAttributesW(
+            &HSTRING::from(path.as_os_str()),
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY,
+        )
     };
-    ensure!(unsupported.is_err(), "Unsupported hidden attribute falsely succeeded");
-    ensure!(!fs::metadata(&backing)?.permissions().readonly(), "Rejected attribute request partially changed permissions");
-    ensure!(fs::read(&backing)? == b"preserve", "Attribute request changed source bytes");
+    ensure!(
+        unsupported.is_err(),
+        "Unsupported hidden attribute falsely succeeded"
+    );
+    ensure!(
+        !fs::metadata(&backing)?.permissions().readonly(),
+        "Rejected attribute request partially changed permissions"
+    );
+    ensure!(
+        fs::read(&backing)? == b"preserve",
+        "Attribute request changed source bytes"
+    );
     fs::write(&path, b"writable again")?;
-    ensure!(fs::read(&backing)? == b"writable again", "Cleared read-only file stayed unwritable");
+    ensure!(
+        fs::read(&backing)? == b"writable again",
+        "Cleared read-only file stayed unwritable"
+    );
     fs::remove_file(&path)?;
-    println!("NATIVE_WINDOWS_ATTRIBUTES_PASS: read-only set/clear reaches provider, blocks new writes/deletion, and unsupported attributes fail without partial changes");
+    println!(
+        "NATIVE_WINDOWS_ATTRIBUTES_PASS: read-only set/clear reaches provider, blocks new writes/deletion, and unsupported attributes fail without partial changes"
+    );
     Ok(())
 }
 
@@ -538,49 +682,101 @@ fn file_times(target: &Path, source: &Path) -> Result<()> {
         ..Default::default()
     };
     let apply = |info: &FILE_BASIC_INFO| unsafe {
-        SetFileInformationByHandle(handle, FileBasicInfo, (info as *const FILE_BASIC_INFO).cast(),
-            std::mem::size_of::<FILE_BASIC_INFO>() as u32)
+        SetFileInformationByHandle(
+            handle,
+            FileBasicInfo,
+            (info as *const FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
     };
     apply(&initial).context("Set access/modification times through attribute-only handle")?;
     let mut observed = FILE_BASIC_INFO::default();
-    unsafe { GetFileInformationByHandleEx(handle, FileBasicInfo,
-        (&mut observed as *mut FILE_BASIC_INFO).cast(), std::mem::size_of::<FILE_BASIC_INFO>() as u32)?; }
-    ensure!(observed.LastAccessTime == initial.LastAccessTime && observed.LastWriteTime == initial.LastWriteTime,
-        "Mapped timestamps did not round trip");
-    ensure!(observed.CreationTime == 0 && observed.ChangeTime == 0,
-        "Bridge invented unavailable creation/change timestamps");
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&mut observed as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )?;
+    }
+    ensure!(
+        observed.LastAccessTime == initial.LastAccessTime
+            && observed.LastWriteTime == initial.LastWriteTime,
+        "Mapped timestamps did not round trip"
+    );
+    ensure!(
+        observed.CreationTime == 0 && observed.ChangeTime == 0,
+        "Bridge invented unavailable creation/change timestamps"
+    );
     let before = fs::metadata(&backing)?;
-    ensure!(before.accessed()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_000,
-        "Access time did not reach backing file");
-    ensure!(before.modified()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_123,
-        "Modification time did not reach backing file");
+    ensure!(
+        before.accessed()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_000,
+        "Access time did not reach backing file"
+    );
+    ensure!(
+        before.modified()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_123,
+        "Modification time did not reach backing file"
+    );
     for rejected in [
-        FILE_BASIC_INFO { CreationTime: initial.LastWriteTime, LastWriteTime: initial.LastWriteTime + 10_000_000, FileAttributes: FILE_ATTRIBUTE_READONLY.0, ..Default::default() },
-        FILE_BASIC_INFO { ChangeTime: initial.LastWriteTime, ..Default::default() },
-        FILE_BASIC_INFO { LastWriteTime: EPOCH - 10_000_000, ..Default::default() },
+        FILE_BASIC_INFO {
+            CreationTime: initial.LastWriteTime,
+            LastWriteTime: initial.LastWriteTime + 10_000_000,
+            FileAttributes: FILE_ATTRIBUTE_READONLY.0,
+            ..Default::default()
+        },
+        FILE_BASIC_INFO {
+            ChangeTime: initial.LastWriteTime,
+            ..Default::default()
+        },
+        FILE_BASIC_INFO {
+            LastWriteTime: EPOCH - 10_000_000,
+            ..Default::default()
+        },
     ] {
-        ensure!(apply(&rejected).is_err(), "Unsupported time change falsely succeeded");
+        ensure!(
+            apply(&rejected).is_err(),
+            "Unsupported time change falsely succeeded"
+        );
         let after = fs::metadata(&backing)?;
-        ensure!(after.modified()? == before.modified()? && after.accessed()? == before.accessed()?,
-            "Rejected timestamp request changed backing times");
-        ensure!(!after.permissions().readonly(), "Rejected time request partially changed permissions");
+        ensure!(
+            after.modified()? == before.modified()? && after.accessed()? == before.accessed()?,
+            "Rejected timestamp request changed backing times"
+        );
+        ensure!(
+            !after.permissions().readonly(),
+            "Rejected time request partially changed permissions"
+        );
     }
     // CopyFileW bundles metadata-change time with supported modification time.
     // Preserve the latter and report the unsupported field to the parent.
-    apply(&FILE_BASIC_INFO { ChangeTime: initial.LastWriteTime,
-        LastWriteTime: initial.LastWriteTime + 10_000_000, ..Default::default() })?;
-    ensure!(fs::metadata(&backing)?.modified()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_124,
-        "Bundled metadata-change time prevented supported modification time");
+    apply(&FILE_BASIC_INFO {
+        ChangeTime: initial.LastWriteTime,
+        LastWriteTime: initial.LastWriteTime + 10_000_000,
+        ..Default::default()
+    })?;
+    ensure!(
+        fs::metadata(&backing)?
+            .modified()?
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            == 1_600_000_124,
+        "Bundled metadata-change time prevented supported modification time"
+    );
     drop(file);
     fs::remove_file(&path)?;
-    println!("NATIVE_WINDOWS_TIMES_PASS: supported times reach source, including bundled change-time requests; unavailable times stay absent; unsupported creation/pre-epoch requests have no partial effects");
+    println!(
+        "NATIVE_WINDOWS_TIMES_PASS: supported times reach source, including bundled change-time requests; unavailable times stay absent; unsupported creation/pre-epoch requests have no partial effects"
+    );
     Ok(())
 }
 
 fn nt_overwrite(path: &Path, attributes: u32) -> Result<fs::File> {
     use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
-    use windows::{core::PWSTR, Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::*},
-        Win32::{Foundation::*, Storage::FileSystem::*, System::IO::IO_STATUS_BLOCK}};
+    use windows::{
+        Wdk::{Foundation::OBJECT_ATTRIBUTES, Storage::FileSystem::*},
+        Win32::{Foundation::*, Storage::FileSystem::*, System::IO::IO_STATUS_BLOCK},
+        core::PWSTR,
+    };
     let mut name = std::ffi::OsString::from(r"\??\");
     name.push(path);
     let mut wide: Vec<u16> = name.encode_wide().collect();
@@ -599,52 +795,104 @@ fn nt_overwrite(path: &Path, attributes: u32) -> Result<fs::File> {
     let mut status = IO_STATUS_BLOCK::default();
     // FILE_OVERWRITE + synchronous non-directory I/O. Unlike the Rust standard
     // library's reopen/truncate path, this actually supplies overwrite attributes.
-    let result = unsafe { NtCreateFile(&mut handle, FILE_GENERIC_WRITE, &object, &mut status,
-        None, FILE_FLAGS_AND_ATTRIBUTES(attributes), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        FILE_OVERWRITE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, None, 0) };
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_WRITE,
+            &object,
+            &mut status,
+            None,
+            FILE_FLAGS_AND_ATTRIBUTES(attributes),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OVERWRITE,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+            None,
+            0,
+        )
+    };
     result.ok().context("NtCreateFile FILE_OVERWRITE")?;
     Ok(unsafe { fs::File::from_raw_handle(handle.0) })
 }
 
 fn creation_attributes(target: &Path, source: &Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    use windows::{Win32::Storage::FileSystem::*, core::HSTRING};
     let path = target.join("created-readonly.txt");
     let backing = source.join("created-readonly.txt");
-    let mut file = fs::OpenOptions::new().write(true).create_new(true)
-        .attributes(FILE_ATTRIBUTE_READONLY.0).open(&path)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .attributes(FILE_ATTRIBUTE_READONLY.0)
+        .open(&path)?;
     file.write_all(b"initial writer")?;
     file.sync_all()?;
     drop(file);
-    ensure!(fs::metadata(&backing)?.permissions().readonly(), "Creation lost read-only flag");
-    ensure!(fs::read(&backing)? == b"initial writer", "Read-only creation prevented its initial writer");
-    ensure!(fs::OpenOptions::new().write(true).open(&path).is_err(), "Read-only creation allowed a later writer");
-    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    ensure!(
+        fs::metadata(&backing)?.permissions().readonly(),
+        "Creation lost read-only flag"
+    );
+    ensure!(
+        fs::read(&backing)? == b"initial writer",
+        "Read-only creation prevented its initial writer"
+    );
+    ensure!(
+        fs::OpenOptions::new().write(true).open(&path).is_err(),
+        "Read-only creation allowed a later writer"
+    );
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?;
+    }
     fs::remove_file(&path)?;
 
     let unsupported_path = target.join("unsupported-create.txt");
-    ensure!(fs::OpenOptions::new().write(true).create_new(true)
-        .attributes(FILE_ATTRIBUTE_HIDDEN.0).open(&unsupported_path).is_err(), "Unsupported creation falsely succeeded");
-    ensure!(!source.join("unsupported-create.txt").exists(), "Rejected creation left a backing file");
+    ensure!(
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .attributes(FILE_ATTRIBUTE_HIDDEN.0)
+            .open(&unsupported_path)
+            .is_err(),
+        "Unsupported creation falsely succeeded"
+    );
+    ensure!(
+        !source.join("unsupported-create.txt").exists(),
+        "Rejected creation left a backing file"
+    );
 
     fs::write(&path, b"keep existing bytes")?;
-    ensure!(nt_overwrite(&path, FILE_ATTRIBUTE_HIDDEN.0).is_err(), "Unsupported overwrite falsely succeeded");
-    ensure!(fs::read(&backing)? == b"keep existing bytes", "Rejected overwrite truncated its destination");
+    ensure!(
+        nt_overwrite(&path, FILE_ATTRIBUTE_HIDDEN.0).is_err(),
+        "Unsupported overwrite falsely succeeded"
+    );
+    ensure!(
+        fs::read(&backing)? == b"keep existing bytes",
+        "Rejected overwrite truncated its destination"
+    );
     let mut file = nt_overwrite(&path, FILE_ATTRIBUTE_READONLY.0)?;
     file.write_all(b"replacement")?;
     file.sync_all()?;
     drop(file);
-    ensure!(fs::metadata(&backing)?.permissions().readonly(), "Overwrite lost read-only flag");
-    ensure!(fs::read(&backing)? == b"replacement", "Overwrite did not replace exact bytes");
-    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    ensure!(
+        fs::metadata(&backing)?.permissions().readonly(),
+        "Overwrite lost read-only flag"
+    );
+    ensure!(
+        fs::read(&backing)? == b"replacement",
+        "Overwrite did not replace exact bytes"
+    );
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?;
+    }
     fs::remove_file(&path)?;
-    println!("NATIVE_WINDOWS_CREATE_ATTRIBUTES_PASS: create/overwrite preserve read-only while initial handles remain writable; unsupported attributes do not create or truncate files");
+    println!(
+        "NATIVE_WINDOWS_CREATE_ATTRIBUTES_PASS: create/overwrite preserve read-only while initial handles remain writable; unsupported attributes do not create or truncate files"
+    );
     Ok(())
 }
 
 #[test]
 fn native_overwrite_api_baseline() -> Result<()> {
-    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    use windows::{Win32::Storage::FileSystem::*, core::HSTRING};
     let local = tempfile::tempdir()?;
     let path = local.path().join("overwrite-baseline.txt");
     fs::write(&path, b"before")?;
@@ -653,14 +901,22 @@ fn native_overwrite_api_baseline() -> Result<()> {
     file.sync_all()?;
     drop(file);
     let readonly = fs::metadata(&path)?.permissions().readonly();
-    unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
-    ensure!(readonly, "Native API baseline did not apply overwrite attributes");
-    ensure!(fs::read(&path)? == b"after", "Native API baseline lost overwritten bytes");
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_ATTRIBUTE_NORMAL)?;
+    }
+    ensure!(
+        readonly,
+        "Native API baseline did not apply overwrite attributes"
+    );
+    ensure!(
+        fs::read(&path)? == b"after",
+        "Native API baseline lost overwritten bytes"
+    );
     Ok(())
 }
 
 fn native_copy(target: &Path, source: &Path) -> Result<()> {
-    use windows::{core::HSTRING, Win32::Storage::FileSystem::*};
+    use windows::{Win32::Storage::FileSystem::*, core::HSTRING};
     let local = tempfile::tempdir()?;
     let input = local.path().join("local-input.txt");
     let output = local.path().join("local-output.txt");
@@ -668,31 +924,96 @@ fn native_copy(target: &Path, source: &Path) -> Result<()> {
     let contents: Vec<u8> = (0..65_539).map(|i| (i % 251) as u8).collect();
     fs::write(&input, &contents)?;
     fs::OpenOptions::new().write(true).open(&input)?.set_times(
-        fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_123)))?;
-    unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), true) }
-        .context("Native CopyFileW from local filesystem into mounted directory")?;
-    ensure!(fs::read(source.join("copied.txt"))? == contents, "Local-to-mounted copy changed bytes");
-    ensure!(fs::metadata(source.join("copied.txt"))?.modified()?.duration_since(UNIX_EPOCH)?.as_secs() == 1_600_000_123,
-        "Local-to-mounted copy lost supported modification time");
-    unsafe { CopyFileW(&HSTRING::from(mounted.as_os_str()), &HSTRING::from(output.as_os_str()), true) }
-        .context("Native CopyFileW from mounted directory to local filesystem")?;
-    ensure!(fs::read(&output)? == contents, "Mounted-to-local copy changed bytes");
-    ensure!(unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), true) }.is_err(),
-        "Exclusive native copy overwrote an existing destination");
+        fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1_600_000_123)),
+    )?;
+    unsafe {
+        CopyFileW(
+            &HSTRING::from(input.as_os_str()),
+            &HSTRING::from(mounted.as_os_str()),
+            true,
+        )
+    }
+    .context("Native CopyFileW from local filesystem into mounted directory")?;
+    ensure!(
+        fs::read(source.join("copied.txt"))? == contents,
+        "Local-to-mounted copy changed bytes"
+    );
+    ensure!(
+        fs::metadata(source.join("copied.txt"))?
+            .modified()?
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            == 1_600_000_123,
+        "Local-to-mounted copy lost supported modification time"
+    );
+    unsafe {
+        CopyFileW(
+            &HSTRING::from(mounted.as_os_str()),
+            &HSTRING::from(output.as_os_str()),
+            true,
+        )
+    }
+    .context("Native CopyFileW from mounted directory to local filesystem")?;
+    ensure!(
+        fs::read(&output)? == contents,
+        "Mounted-to-local copy changed bytes"
+    );
+    ensure!(
+        unsafe {
+            CopyFileW(
+                &HSTRING::from(input.as_os_str()),
+                &HSTRING::from(mounted.as_os_str()),
+                true,
+            )
+        }
+        .is_err(),
+        "Exclusive native copy overwrote an existing destination"
+    );
     fs::write(&input, b"overwrite via native copy")?;
-    unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), false) }
-        .context("Native CopyFileW replacing an existing mounted file")?;
-    ensure!(fs::read(source.join("copied.txt"))? == b"overwrite via native copy", "Native copy overwrite lost data");
+    unsafe {
+        CopyFileW(
+            &HSTRING::from(input.as_os_str()),
+            &HSTRING::from(mounted.as_os_str()),
+            false,
+        )
+    }
+    .context("Native CopyFileW replacing an existing mounted file")?;
+    ensure!(
+        fs::read(source.join("copied.txt"))? == b"overwrite via native copy",
+        "Native copy overwrite lost data"
+    );
     fs::remove_file(&mounted)?;
-    unsafe { SetFileAttributesW(&HSTRING::from(input.as_os_str()), FILE_ATTRIBUTE_READONLY)?; }
-    unsafe { CopyFileW(&HSTRING::from(input.as_os_str()), &HSTRING::from(mounted.as_os_str()), true) }
-        .context("Native CopyFileW copying a read-only source")?;
-    ensure!(fs::metadata(source.join("copied.txt"))?.permissions().readonly(), "Native copy lost source read-only attribute");
-    ensure!(fs::read(source.join("copied.txt"))? == b"overwrite via native copy", "Read-only native copy lost data");
-    unsafe { SetFileAttributesW(&HSTRING::from(input.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
-    unsafe { SetFileAttributesW(&HSTRING::from(mounted.as_os_str()), FILE_ATTRIBUTE_NORMAL)?; }
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(input.as_os_str()), FILE_ATTRIBUTE_READONLY)?;
+    }
+    unsafe {
+        CopyFileW(
+            &HSTRING::from(input.as_os_str()),
+            &HSTRING::from(mounted.as_os_str()),
+            true,
+        )
+    }
+    .context("Native CopyFileW copying a read-only source")?;
+    ensure!(
+        fs::metadata(source.join("copied.txt"))?
+            .permissions()
+            .readonly(),
+        "Native copy lost source read-only attribute"
+    );
+    ensure!(
+        fs::read(source.join("copied.txt"))? == b"overwrite via native copy",
+        "Read-only native copy lost data"
+    );
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(input.as_os_str()), FILE_ATTRIBUTE_NORMAL)?;
+    }
+    unsafe {
+        SetFileAttributesW(&HSTRING::from(mounted.as_os_str()), FILE_ATTRIBUTE_NORMAL)?;
+    }
     fs::remove_file(&mounted)?;
-    println!("NATIVE_WINDOWS_COPY_PASS: CopyFileW transfers both directions, preserves supported modification time, honors exclusive creation and overwrites existing destinations");
+    println!(
+        "NATIVE_WINDOWS_COPY_PASS: CopyFileW transfers both directions, preserves supported modification time, honors exclusive creation and overwrites existing destinations"
+    );
     Ok(())
 }
 
@@ -798,23 +1119,43 @@ async fn native_windows_mount() -> Result<()> {
     native_scenario(true).await
 }
 
+#[path = "../src/windows_drives.rs"]
+mod windows_drives;
+
 async fn native_scenario(lose_transport: bool) -> Result<()> {
     let drives = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
     ensure!(drives != 0, "Cannot enumerate local drives");
     let letter = (b'D'..=b'Z')
         .rev()
-        .find(|c| drives & (1 << (c - b'A')) == 0)
+        .find(|c| {
+            drives & (1 << (c - b'A')) == 0
+                && matches!(
+                    windows_drives::reserved(&format!("{}:", *c as char)),
+                    Ok(false)
+                )
+        })
         .context("No free test drive")?;
     let mount = format!("{}:", letter as char);
     let target = PathBuf::from(format!("{mount}\\"));
     let backing = tempfile::tempdir()?;
     fs::write(backing.path().join("denied.txt"), b"fixture")?;
-    for name in ["write-failed.bin", "write-offline.bin", "write-timeout.bin", "write-readonly.bin", "flush-failed.bin", "close-failed.bin", "delete-failed.bin"] {
+    for name in [
+        "write-failed.bin",
+        "write-offline.bin",
+        "write-timeout.bin",
+        "write-readonly.bin",
+        "flush-failed.bin",
+        "close-failed.bin",
+        "delete-failed.bin",
+    ] {
         fs::write(backing.path().join(name), b"original")?;
     }
     let control = Arc::new(BridgeControl::default());
     let flush_audit = Arc::new(FlushAudit::default());
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_shellcanvas-drive-bridge"))
+    let executable = std::env::var_os("SHELLCANVAS_NATIVE_BRIDGE_EXECUTABLE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_shellcanvas-drive-bridge")));
+    let mut child = tokio::process::Command::new(executable)
         .args(["--mount", &mount])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -862,7 +1203,14 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         warning(&control, "Metadata-change time is unavailable").await?;
         let p = target.clone(); let source = backing.path().to_owned();
         let volume_name = mount.clone(); let audit = flush_audit.clone();
-        tokio::task::spawn_blocking(move || volume_flush(&volume_name, &p, &source, &audit)).await??;
+        // Opening a volume for direct flushing requires elevated Windows access.
+        // CI exercises this by default; ordinary desktop accounts can explicitly
+        // omit only this privileged subtest while retaining per-file flush tests.
+        if std::env::var("SHELLCANVAS_SKIP_PRIVILEGED_VOLUME_FLUSH").as_deref() == Ok("1") {
+            println!("NATIVE_WINDOWS_VOLUME_FLUSH_NOT_RUN: explicitly omitted privileged volume access; per-file flush remains exercised");
+        } else {
+            tokio::task::spawn_blocking(move || volume_flush(&volume_name, &p, &source, &audit)).await??;
+        }
         let p = target.clone(); let source = backing.path().to_owned();
         tokio::task::spawn_blocking(move || failed_writes(&p, &source)).await??;
         drop(fs::File::open(target.join("close-failed.bin"))?);
@@ -873,6 +1221,10 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         warning(&control, "Remote deletion failed during Windows cleanup").await?;
         ensure!(backing.path().join("delete-failed.bin").exists(), "Failed cleanup deletion lost source");
         println!("NATIVE_WINDOWS_WARNING_PASS: close and cleanup deletion failures delivered to the parent");
+        // Explorer keeps read-only folder handles alive. They must not prevent
+        // detach once real file handles have been closed.
+        use std::os::windows::fs::OpenOptionsExt;
+        let browsing = fs::OpenOptions::new().read(true).custom_flags(0x02000000).open(&target)?;
         let held = fs::File::open(target.join("seek.bin"))?;
         control.request_detach()?;
         phase(&control, BridgePhase::Attached).await?;
@@ -883,6 +1235,7 @@ async fn native_scenario(lose_transport: bool) -> Result<()> {
         phase(&control, BridgePhase::Detached).await?;
         ensure!(tokio::time::timeout(Duration::from_secs(10), child.wait()).await??.success(), "Bridge exit failed");
         ensure!(unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() } & (1 << (letter - b'A')) == 0, "Drive remained after detach");
+        drop(browsing);
         println!("NATIVE_WINDOWS_DETACH_PASS: busy file preserved mapping; ordinary detach removed drive after close");
         Ok(())
     }.await;

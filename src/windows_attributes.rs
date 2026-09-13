@@ -13,7 +13,9 @@ pub fn creation_attributes(requested: u32, directory: bool) -> FsResult<u32> {
     let requested = requested & !0x20;
     validate_attributes(requested)?;
     if directory && requested & READONLY != 0 {
-        return Err(unsupported("Read-only creation is supported only for regular files"));
+        return Err(unsupported(
+            "Read-only creation is supported only for regular files",
+        ));
     }
     Ok(requested)
 }

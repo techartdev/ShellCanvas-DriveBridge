@@ -61,12 +61,30 @@ jobs:
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig" >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target ${{ matrix.rust }}
       - run: cargo test --locked --workspace --target ${{ matrix.rust }}
+      - name: Install signed WinFsp runtime on the disposable runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $msi).Hash -ne '073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A') { throw 'WinFsp installer hash mismatch' }
+          $signature = Get-AuthenticodeSignature -LiteralPath $msi
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Navimatics') { throw 'WinFsp installer signature mismatch' }
+          $install = Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $msi + '"'), '/qn', '/norestart', 'INSTALLLEVEL=1000') -WindowStyle Hidden -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) { throw "WinFsp installation failed: $($install.ExitCode)" }
+      - name: Native Windows filesystem acceptance
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        env:
+          SHELLCANVAS_NATIVE_WINDOWS_TEST: '1'
+        run: cargo test --release --locked --target ${{ matrix.rust }} --test native_windows -- --ignored --nocapture
       - name: Prepare executable
         shell: bash
         run: |
           mkdir -p release
           suffix=""
           if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; fi
+          "target/$RUST_TARGET/release/shellcanvas-drive-bridge$suffix" --version > "release/$BRIDGE_TARGET.version"
           cp "target/$RUST_TARGET/release/shellcanvas-drive-bridge$suffix" "release/shellcanvas-drive-bridge-${RELEASE_TAG#v}-$BRIDGE_TARGET$suffix"
       - uses: actions/upload-artifact@v4
         with:
@@ -94,6 +112,7 @@ jobs:
       - name: Prepare signed manifest and notices
         run: |
           cp LICENSE THIRD-PARTY.md release/
+          node scripts/dependency-notices.mjs release/DEPENDENCY-LICENSES.txt
           node scripts/release-manifest.mjs release "$RELEASE_TAG"
           npm install --no-save @tauri-apps/cli@2.11.4
       - name: Sign release manifest

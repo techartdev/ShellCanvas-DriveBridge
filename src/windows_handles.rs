@@ -3,6 +3,13 @@
 use shellcanvas_filesystem_sdk::{FsError, FsErrorKind, FsResult, MountPath};
 use std::sync::{Arc, Mutex, Weak};
 
+/// Browsing directory handles do not retain file data or writable mappings.
+/// Keep every file context and all mutation-capable directory contexts blocking.
+pub fn blocks_detach(is_directory: bool, granted_access: u32) -> bool {
+    const DIRECTORY_MUTATION: u32 = 0x2 | 0x4 | 0x10 | 0x100 | 0x10000 | 0x40000 | 0x80000;
+    !is_directory || granted_access & DIRECTORY_MUTATION != 0
+}
+
 pub struct OpenHandle {
     pub path: Arc<Mutex<MountPath>>,
     pub file: Mutex<Option<u64>>,
@@ -77,6 +84,18 @@ impl OpenHandles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passive_directory_handles_do_not_block_but_files_and_mutators_do() {
+        assert!(!blocks_detach(
+            true,
+            0x1 | 0x8 | 0x20 | 0x80 | 0x20000 | 0x100000
+        ));
+        assert!(blocks_detach(false, 0));
+        assert!(blocks_detach(false, 0x1));
+        for access in [0x2, 0x4, 0x10, 0x100, 0x10000, 0x40000, 0x80000] {
+            assert!(blocks_detach(true, access));
+        }
+    }
     fn path(parts: &[&str]) -> MountPath {
         parts
             .iter()

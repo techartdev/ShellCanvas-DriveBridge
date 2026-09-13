@@ -67,7 +67,7 @@ struct Directory {
     eof: bool,
 }
 pub struct Context {
-    _open: crate::mount_gate::OpenGuard,
+    _open: Option<crate::mount_gate::OpenGuard>,
     path: Arc<Mutex<MountPath>>,
     file: Option<u64>,
     directory: Mutex<Directory>,
@@ -177,7 +177,7 @@ impl Fs {
             writable: access & (0x2 | 0x4) != 0 || create != FsCreate::OpenExisting,
         });
         let context = Context {
-            _open: open,
+            _open: crate::windows_handles::blocks_detach(is_dir, access).then_some(open),
             path,
             file,
             directory: Mutex::new(Directory {
@@ -254,18 +254,25 @@ impl FileSystemContext for Fs {
             .map_err(|_| FspError::from(STATUS_DEVICE_NOT_CONNECTED))?;
         let path = path(name)?;
         let is_dir = options & 1 != 0;
-        let requested_attributes = crate::windows_attributes::creation_attributes(requested_attributes, is_dir)
-            .map_err(failure)?;
+        let requested_attributes =
+            crate::windows_attributes::creation_attributes(requested_attributes, is_dir)
+                .map_err(failure)?;
         if is_dir {
             self.call(Operation::Mkdir { path: path.clone() })?;
         }
         let context = self.open_context(path, access, FsCreate::CreateNew, is_dir, open)?;
         let initialized = (|| {
             let meta = self.metadata(&context)?;
-            if let Some(permissions) = crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)? {
+            if let Some(permissions) =
+                crate::windows_attributes::permissions(&meta, requested_attributes)
+                    .map_err(failure)?
+            {
                 self.call(Operation::SetFileMetadata {
                     handle: context.file.ok_or_else(invalid)?,
-                    metadata: FsSetMetadata { permissions: Some(permissions), ..Default::default() },
+                    metadata: FsSetMetadata {
+                        permissions: Some(permissions),
+                        ..Default::default()
+                    },
                 })?;
             }
             fill(info.as_mut(), &self.metadata(&context)?);
@@ -385,16 +392,22 @@ impl FileSystemContext for Fs {
             return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
         }
         let meta = self.metadata(context)?;
-        let mut requested_attributes = crate::windows_attributes::creation_attributes(requested_attributes, false)
-            .map_err(failure)?;
+        let mut requested_attributes =
+            crate::windows_attributes::creation_attributes(requested_attributes, false)
+                .map_err(failure)?;
         if !replace_attributes {
             requested_attributes |= attributes(&meta);
         }
         // Validate the complete request before truncating an existing file.
-        let permissions = crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)?;
+        let permissions =
+            crate::windows_attributes::permissions(&meta, requested_attributes).map_err(failure)?;
         self.call(Operation::SetFileMetadata {
             handle: context.file.ok_or_else(invalid)?,
-            metadata: FsSetMetadata { size: Some(0), permissions, ..Default::default() },
+            metadata: FsSetMetadata {
+                size: Some(0),
+                permissions,
+                ..Default::default()
+            },
         })?;
         fill(info, &self.metadata(context)?);
         Ok(())
@@ -413,15 +426,22 @@ impl FileSystemContext for Fs {
         // then ignores an unsupported result. Preserve representable times and
         // warn about the omitted change time instead of silently losing mtime.
         let omitted_change_time = changed != 0 && (access != 0 || write != 0);
-        validate_unsupported_times(created, if omitted_change_time { 0 } else { changed }).map_err(failure)?;
+        validate_unsupported_times(created, if omitted_change_time { 0 } else { changed })
+            .map_err(failure)?;
         let metadata = FsSetMetadata {
             accessed: unix_seconds(access).map_err(failure)?,
             modified: unix_seconds(write).map_err(failure)?,
-            permissions: crate::windows_attributes::permissions(&self.metadata(context)?, requested_attributes)
-                .map_err(failure)?,
+            permissions: crate::windows_attributes::permissions(
+                &self.metadata(context)?,
+                requested_attributes,
+            )
+            .map_err(failure)?,
             ..Default::default()
         };
-        if metadata.accessed.is_some() || metadata.modified.is_some() || metadata.permissions.is_some() {
+        if metadata.accessed.is_some()
+            || metadata.modified.is_some()
+            || metadata.permissions.is_some()
+        {
             if !self.caps.writable {
                 return Err(STATUS_MEDIA_WRITE_PROTECTED.into());
             }
@@ -435,7 +455,11 @@ impl FileSystemContext for Fs {
             }
         }
         fill(info, &self.metadata(context)?);
-        if omitted_change_time && !self.warned_change_time.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if omitted_change_time
+            && !self
+                .warned_change_time
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             self.warn("Metadata-change time is unavailable on this remote filesystem. Requested access/modification times were preserved; change time was omitted.".into());
         }
         Ok(())
@@ -583,12 +607,17 @@ impl FileSystemContext for Fs {
 pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Result<()> {
     // Build against the bundled SDK; load only the separately installed runtime
     // from the machine registry. Never search a writable current directory.
-    let setup = |error| anyhow::anyhow!("WinFsp is unavailable. Install or repair the WinFsp runtime from https://winfsp.dev/rel/, then try attaching again. Driver setup requires administrator approval. Details: {error}");
+    let setup = |error| {
+        anyhow::anyhow!(
+            "WinFsp is unavailable. Install or repair the WinFsp runtime from https://winfsp.dev/rel/, then try attaching again. Driver setup requires administrator approval. Details: {error}"
+        )
+    };
     let installation = windows_registry::LOCAL_MACHINE
         .open("SOFTWARE\\WOW6432Node\\WinFsp")
         .or_else(|_| windows_registry::LOCAL_MACHINE.open("SOFTWARE\\WinFsp"))
         .map_err(&setup)?
-        .get_string("InstallDir").map_err(&setup)?;
+        .get_string("InstallDir")
+        .map_err(&setup)?;
     let dll = if cfg!(target_arch = "aarch64") {
         "winfsp-a64.dll"
     } else {
@@ -635,6 +664,14 @@ pub fn run(pipe: Arc<Pipe>, caps: FsCapabilities, target: &OsStr) -> anyhow::Res
             caps,
         },
     )?;
+    anyhow::ensure!(
+        !crate::windows_drives::reserved(
+            target
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid drive letter"))?
+        )?,
+        "Drive letter is mounted or reserved by a network connection"
+    );
     host.mount(target)?;
     host.start()?;
     pipe.call(Operation::Report {
