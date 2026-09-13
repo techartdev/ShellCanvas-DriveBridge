@@ -203,7 +203,11 @@ impl MountedFileSystem for LocalRoot {
         options: FsOpenOptions,
     ) -> FsResult<Arc<dyn MountedFile>> {
         options.validate()?;
-        if path.components().last().is_some_and(|p| p == "denied.txt") {
+        if path
+            .components()
+            .last()
+            .is_some_and(|p| p == "denied.txt" || p == "metadata-only.txt")
+        {
             return Err(FsError::new(
                 FsErrorKind::PermissionDenied,
                 "Fixture denies this file",
@@ -242,8 +246,9 @@ impl MountedFileSystem for LocalRoot {
         ))))
     }
     async fn set_metadata(&self, path: &MountPath, m: FsSetMetadata) -> FsResult<()> {
+        use std::os::windows::fs::OpenOptionsExt;
         let file = fs::OpenOptions::new()
-            .write(true)
+            .access_mode(0x100 | if m.size.is_some() { 0x2 } else { 0 })
             .open(self.path(path))
             .map_err(error)?;
         set(&file, m).map_err(error)
@@ -1105,6 +1110,23 @@ fn exercise(target: &Path, source: &Path) -> Result<()> {
     file_times(target, source)?;
     creation_attributes(target, source)?;
     native_copy(target, source)?;
+    // A namespace/attribute operation must not require data-read permission or
+    // allocate a remote data handle that blocks the rename itself.
+    fs::write(
+        source.join("metadata-only.txt"),
+        b"keep metadata-only bytes",
+    )?;
+    ensure!(fs::File::open(target.join("metadata-only.txt")).is_err());
+    ensure!(fs::metadata(target.join("metadata-only.txt"))?.len() == 24);
+    fs::rename(
+        target.join("metadata-only.txt"),
+        target.join("metadata-renamed.txt"),
+    )?;
+    ensure!(fs::read(source.join("metadata-renamed.txt"))? == b"keep metadata-only bytes");
+    fs::remove_file(target.join("metadata-renamed.txt"))?;
+    println!(
+        "NATIVE_WINDOWS_METADATA_ONLY_PASS: rename and metadata do not require a provider data handle"
+    );
     Ok(())
 }
 
