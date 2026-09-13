@@ -1,4 +1,18 @@
-Drive Bridge packages for Windows x64, Linux x64, and macOS Intel/Apple silicon.
+Drive Bridge 0.1.1 replaces 0.1.0, which was accidentally built from a branch
+without the protocol-2 lifecycle changes required by the current desktop.
+Use 0.1.1 with current ShellCanvas builds; do not install 0.1.0.
+
+Includes graceful busy detach, passive Explorer folder-handle handling,
+remembered drive-letter reservation, native file semantics and lifecycle tests.
+The signed manifest and version output derive their protocol from the SDK.
+
+Known Windows SFTP limitation: a second reader while a writable remote handle is
+open, and native rename in the tested workflow, can fail with an I/O error.
+Close-after-save followed by open/read and busy/ordinary detach passed through
+the current desktop SDK; rejected rename preserved the source. Broader Windows
+SFTP sharing and rename compatibility remains follow-up work.
+
+Packages for Windows x64, Linux x64, and macOS Intel/Apple silicon.
 
 Install through ShellCanvas Settings → Files → Drive Bridge. ShellCanvas selects
 the local client's package and verifies its signed manifest and executable hash.

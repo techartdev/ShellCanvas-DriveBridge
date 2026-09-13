@@ -86,7 +86,10 @@ mod tests {
     use super::*;
     #[test]
     fn passive_directory_handles_do_not_block_but_files_and_mutators_do() {
-        assert!(!blocks_detach(true, 0x1 | 0x8 | 0x20 | 0x80 | 0x20000 | 0x100000));
+        assert!(!blocks_detach(
+            true,
+            0x1 | 0x8 | 0x20 | 0x80 | 0x20000 | 0x100000
+        ));
         assert!(blocks_detach(false, 0));
         assert!(blocks_detach(false, 0x1));
         for access in [0x2, 0x4, 0x10, 0x100, 0x10000, 0x40000, 0x80000] {

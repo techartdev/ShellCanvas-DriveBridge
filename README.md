@@ -4,13 +4,12 @@ An optional, free native app for attaching a folder from a ShellCanvas file
 provider as a local drive or mount point. Local applications can then open and
 save remote files through the operating system's filesystem interface.
 
-**Preview release — not an end-user release yet:** [download native packages](https://github.com/techartdev/ShellCanvas-DriveBridge/releases/latest)
+**Preview release 0.1.1:** [download native packages](https://github.com/techartdev/ShellCanvas-DriveBridge/releases/latest)
 for Windows x64, Linux x64, and Intel/Apple silicon macOS. Windows, Linux and
 macOS builds pass in CI. Native Linux mounts pass live SFTP file-operation checks.
 Native Windows mounts pass file-operation, memory-mapping and busy-detach tests
 with WinFsp and a disposable local provider. The Windows executable also passes
-the separate-process SFTP protocol test. A desktop-created Windows SFTP mapping,
-the installation UI and macOS native runtime acceptance remain unverified.
+the separate-process SFTP protocol test. Desktop-created Windows SFTP mapping, browsing and opening files have been manually confirmed. macOS native runtime acceptance remains pending.
 Do not treat compilation as verified filesystem compatibility.
 
 ## Install
@@ -92,6 +91,12 @@ terminal without the host protocol will not establish a connection. The internal
 it creates and removes test files and must not receive a user's working folder.
 
 ## Current semantics and limitations
+
+- On the tested Windows OpenSSH host, a second reader while a writable remote
+  handle remained open and native rename returned I/O errors. Save-close-open,
+  independent SFTP byte verification, busy detach and ordinary detach passed.
+  Rejected rename preserved source bytes. Local-provider native tests do not
+  establish these Windows SFTP semantics; further compatibility work is needed.
 
 - Read/write requests use bounded chunks and real offsets; the whole remote tree
   is not downloaded or indexed before use. Directory pages are consumed lazily.
